@@ -18,7 +18,8 @@ drive storage, but it is recommended to use a full blockchain and have enough
 storage space to spare. The current blockchain is almost 700GB, so ideally you
 should at least have double this space on the drive. You will be given the
 option to use a checkpoint hash to speed up the initial blockchain download, or
-disable it for maximum paranoia.
+disable it for maximum paranoia. It will use any existing blockchain data in
+~/.bitcoin if it exists for the chosen user.
 
 Bitcoind will be preconfigured with suitable mining defaults, and ckpool will
 be configured to start in solo mining mode on port 3333 on the current machine.

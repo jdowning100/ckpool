@@ -43,7 +43,7 @@ if [ -f /etc/systemd/system/bitcoind.service ] || [ -f /etc/systemd/system/ckpoo
 fi
 
 if $PREVIOUS_INSTALL; then
-    read -p "Previous installation detected. Overwrite existing files and services? (y/N, default: no): " overwrite_answer
+    read -p "Previous installation detected. Overwrite existing files and services(no blockchain data will be deleted)? (y/N, default: no): " overwrite_answer
     if [[ ! "$overwrite_answer" =~ ^[Yy]$ ]]; then
         echo "Installation aborted."
         exit 0
@@ -70,6 +70,7 @@ echo "Important: You cannot mine with CKPool-Solo until the Bitcoin Core blockch
 # Prompt for service user (default to current sudo user)
 current_user=${SUDO_USER:-root}
 echo "Optionally, choose a user to run Bitcoin Core and CKPool as (instead of $current_user)."
+echo "Any existing blockchain data in the user's .bitcoin directory will be used."
 read -p "Enter existing username, or 'create' to make a new 'ckpool' user (leave blank for $current_user): " input_user
 if [ "$input_user" = "create" ]; then
     useradd -m -s /bin/bash ckpool
