@@ -26,6 +26,9 @@ be configured to start in solo mining mode on port 3333 on the current machine.
 You will be unable to mine to it until the bitcoin daemon has synced up the
 full blockchain.
 
+You will be given the option to enable donation to the ckpool author, and a
+custom signature to be added to any solved blocks.
+
 ---
 
 SELF INSTALL INSTRUCTIONS (build instructions not included.)
