@@ -15,6 +15,14 @@ AC_CANONICAL_HOST
 dnl Make sure anyone changing configure.ac/Makefile.am has a clue
 AM_MAINTAINER_MODE
 
+AC_MSG_CHECKING([whether to set default CFLAGS])
+if test -z "$CFLAGS"; then
+    CFLAGS="-O2 -Wall -march=native"
+    AC_MSG_RESULT([yes, setting default CFLAGS to $CFLAGS])
+else
+    AC_MSG_RESULT([no, using user-provided CFLAGS])
+fi
+
 dnl Checks for programs
 AC_PROG_CC
 # gl_EARLY - maybe later
