@@ -536,112 +536,233 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	wb->coinb1 = ckzalloc(256);
 	wb->coinb1bin = ckzalloc(128);
 
-	/* Strings in wb should have been zero memset prior. Generate binary
-	 * templates first, then convert to hex */
-	memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
-	ofs += 41; // Fixed header length;
+	/* Check if we have Quai's pre-constructed coinbaseaux */
+	if (wb->coinbaseaux_bin && wb->coinbaseaux_len > 0) {
+		/* Quai format: use coinbaseaux from getBlockTemplate
+		 * Format from go-quai:
+		 *   OP_PUSH<n> <height(variable bytes)>
+		 *   OP_PUSH4   <fabe6d6d(4 bytes)>      magic marker
+		 *   OP_PUSH32  <SealHash(32 bytes)>     seal hash
+		 *   OP_PUSH4   <merkle_size(4 bytes)>   1
+		 *   OP_PUSH4   <merkle_nonce(4 bytes)>  0
+		 *   OP_PUSH4   <extraNonce1(4 bytes)>   miners fill this
+		 *   OP_PUSH8   <extraNonce2(8 bytes)>   miners fill this
+		 *
+		 * The last 13 bytes (0x04 + 4 bytes + 0x08 + 8 bytes) are for nonces.
+		 * We split coinbaseaux before the nonce placeholders.
+		 */
 
-	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
+		/* The coinbaseaux should end with the nonce placeholders:
+		 * Bitcoin standard: 0x0C <12 bytes for extraNonce1+extraNonce2>
+		 * Total: 1 + 12 = 13 bytes for the nonce section
+		 */
+		int nonce_section_len = 13; // 0x0C + 12 bytes (Bitcoin standard)
 
-	/* Put block height at start of template */
-	len = ser_number(wb->coinb1bin + ofs, wb->height);
-	ofs += len;
+		if (wb->coinbaseaux_len < nonce_section_len) {
+			LOGEMERG("coinbaseaux too short: %d bytes (expected at least %d)",
+				wb->coinbaseaux_len, nonce_section_len);
+			exit(1);
+		}
 
-	/* Followed by flag */
-	len = strlen(wb->flags) / 2;
-	wb->coinb1bin[ofs++] = len;
-	hex2bin(wb->coinb1bin + ofs, wb->flags, len);
-	ofs += len;
+		/* Split point: everything except the nonce placeholder opcodes and data */
+		int split_point = wb->coinbaseaux_len - nonce_section_len;
 
-	/* Followed by timestamp */
-	ts_realtime(&now);
-	len = ser_number(wb->coinb1bin + ofs, now.tv_sec);
-	ofs += len;
+		/* The coinbaseaux is just the scriptSig content, not the full tx
+		 * We need to prepend the tx header (41 bytes) ourselves */
 
-	/* Followed by our unique randomiser based on the nsec timestamp */
-	len = ser_number(wb->coinb1bin + ofs, now.tv_nsec);
-	ofs += len;
+		/* Copy scriptsig header (41 bytes) */
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
+		ofs = 41;
 
-	wb->enonce1varlen = ckp->nonce1length;
-	wb->enonce2varlen = ckp->nonce2length;
-	wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen;
+		/* Set nonce lengths for Quai */
+		wb->enonce1constlen = 0; // No constant part for Quai
+		wb->enonce1varlen = 4;  // Fixed 4 bytes for Quai
+		wb->enonce2varlen = 8;  // Fixed 8 bytes for Quai
 
-	wb->coinb1len = ofs;
+		/* Calculate and set the script length at position 41
+		 * Use standard Bitcoin approach: one opcode for combined nonce length
+		 * Length = coinbaseaux prefix + one opcode byte + nonce bytes (4+8=12)
+		 */
+		int scriptsig_data_len = split_point; // Everything before nonce opcodes (52 bytes)
+		int total_scriptsig_len = scriptsig_data_len + 1 + wb->enonce1varlen + wb->enonce2varlen;
+		LOGNOTICE("Quai scriptSig: prefix=%d opcode=1 nonces=%d total=%d",
+			scriptsig_data_len, wb->enonce1varlen + wb->enonce2varlen, total_scriptsig_len);
+		wb->coinb1bin[ofs++] = total_scriptsig_len;
 
-	len = wb->coinb1len - 41;
+		/* Copy the pre-constructed scriptSig data (without nonce section) */
+		memcpy(wb->coinb1bin + ofs, wb->coinbaseaux_bin, scriptsig_data_len);
+		ofs += scriptsig_data_len;
 
-	len += wb->enonce1varlen;
-	len += wb->enonce2varlen;
+		/* Add single opcode for combined nonce length (like standard Bitcoin) */
+		wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen; // 0x0C (12 bytes)
+
+		wb->coinb1len = ofs;
+
+		LOGNOTICE("Using Quai coinbaseaux: %d bytes total, split at %d, coinb1len=%d, scriptsig_len=%d",
+			wb->coinbaseaux_len, split_point, wb->coinb1len, total_scriptsig_len);
+	} else {
+		/* Original Bitcoin-style coinbase construction */
+		/* Strings in wb should have been zero memset prior. Generate binary
+		 * templates first, then convert to hex */
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
+		ofs += 41; // Fixed header length;
+
+		ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
+
+		/* Put block height at start of template */
+		len = ser_number(wb->coinb1bin + ofs, wb->height);
+		ofs += len;
+
+		/* Followed by flag */
+		len = strlen(wb->flags) / 2;
+		wb->coinb1bin[ofs++] = len;
+		hex2bin(wb->coinb1bin + ofs, wb->flags, len);
+		ofs += len;
+
+		/* Followed by timestamp */
+		ts_realtime(&now);
+		len = ser_number(wb->coinb1bin + ofs, now.tv_sec);
+		ofs += len;
+
+		/* Followed by our unique randomiser based on the nsec timestamp */
+		len = ser_number(wb->coinb1bin + ofs, now.tv_nsec);
+		ofs += len;
+
+		wb->enonce1varlen = ckp->nonce1length;
+		wb->enonce2varlen = ckp->nonce2length;
+		wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen;
+
+		wb->coinb1len = ofs;
+
+		len = wb->coinb1len - 41;
+
+		len += wb->enonce1varlen;
+		len += wb->enonce2varlen;
+	}
 
 	wb->coinb2bin = ckzalloc(512);
-	memcpy(wb->coinb2bin, "\x0a\x63\x6b\x70\x6f\x6f\x6c", 7);
-	wb->coinb2len = 7;
-	if (ckp->btcsig) {
-		int siglen = strlen(ckp->btcsig);
 
-		LOGDEBUG("Len %d sig %s", siglen, ckp->btcsig);
-		if (siglen) {
-			wb->coinb2bin[wb->coinb2len++] = siglen;
-			memcpy(wb->coinb2bin + wb->coinb2len, ckp->btcsig, siglen);
-			wb->coinb2len += siglen;
+	/* For Quai, coinb2 starts immediately after the nonces with sequence number
+	 * For Bitcoin, coinb2 includes additional signature data before sequence */
+	if (wb->coinbaseaux_bin && wb->coinbaseaux_len > 0) {
+		/* Quai path: coinb2 starts with sequence number (0xFFFFFFFF) */
+		memcpy(wb->coinb2bin, "\xff\xff\xff\xff", 4);
+		wb->coinb2len = 4;
+	} else {
+		/* Bitcoin path: add ckpool signature */
+		memcpy(wb->coinb2bin, "\x0a\x63\x6b\x70\x6f\x6f\x6c", 7);
+		wb->coinb2len = 7;
+		if (ckp->btcsig) {
+			int siglen = strlen(ckp->btcsig);
+
+			LOGDEBUG("Len %d sig %s", siglen, ckp->btcsig);
+			if (siglen) {
+				wb->coinb2bin[wb->coinb2len++] = siglen;
+				memcpy(wb->coinb2bin + wb->coinb2len, ckp->btcsig, siglen);
+				wb->coinb2len += siglen;
+			}
 		}
-	}
-	len += wb->coinb2len;
+		len += wb->coinb2len;
 
-	wb->coinb1bin[41] = len - 1; /* Set the length now */
+		wb->coinb1bin[41] = len - 1; /* Set the length now */
+
+		/* Add sequence number for standard Bitcoin */
+		memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4);
+		wb->coinb2len += 4;
+	}
+
 	__bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
-	/* Coinbase 1 complete */
-
-	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4);
-	wb->coinb2len += 4;
 
 	// Generation value
 	g64 = wb->coinbasevalue;
-	if (ckp->donvalid && ckp->donation > 0) {
-		double dbl64 = (double)g64 / 100 * ckp->donation;
 
-		d64 = dbl64;
-		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
-		wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
-	} else
-		wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
+	/* Check if we should use Quai's payoutscript */
+	if (wb->payoutscript_bin && wb->payoutscript_len > 0) {
+		/* Quai path: use the payoutscript from getBlockTemplate
+		 * No donation support for Quai (for now) */
+		wb->coinb2bin[wb->coinb2len++] = 1; // Single output
 
-	u64 = (uint64_t *)&wb->coinb2bin[wb->coinb2len];
-	*u64 = htole64(g64);
-	wb->coinb2len += 8;
+		/* Output value */
+		u64 = (uint64_t *)&wb->coinb2bin[wb->coinb2len];
+		*u64 = htole64(g64);
+		wb->coinb2len += 8;
 
-	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
+		/* scriptPubKey length */
+		wb->coinb2bin[wb->coinb2len++] = wb->payoutscript_len;
 
-	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
+		/* scriptPubKey from payoutscript */
+		memcpy(wb->coinb2bin + wb->coinb2len, wb->payoutscript_bin, wb->payoutscript_len);
+		wb->coinb2len += wb->payoutscript_len;
 
-	if (ckp->donvalid && ckp->donation > 0) {
-		u64 = (uint64_t *)wb->coinb3bin;
-		*u64 = htole64(d64);
-		wb->coinb3len += 8;
+		/* Locktime (4 bytes) */
+		memcpy(wb->coinb2bin + wb->coinb2len, "\x00\x00\x00\x00", 4);
+		wb->coinb2len += 4;
 
-		wb->coinb3bin[wb->coinb3len++] = sdata->dontxnlen;
-		memcpy(wb->coinb3bin + wb->coinb3len, sdata->dontxnbin, sdata->dontxnlen);
-		wb->coinb3len += sdata->dontxnlen;
-	} else
-		ckp->donation = 0;
+		/* No coinb3 for Quai */
+		wb->coinb3len = 0;
+		wb->coinb3bin = NULL;
 
-	if (wb->insert_witness) {
-		// 0 value
-		wb->coinb3len += 8;
+		char *cb2_hex = bin2hex(wb->coinb2bin, wb->coinb2len);
+		LOGNOTICE("Quai coinb2: len=%d hex=%s (should start with ffffffff sequence)",
+			wb->coinb2len, cb2_hex);
+		free(cb2_hex);
+		LOGDEBUG("Using Quai payoutscript: %d bytes, value=%lu", wb->payoutscript_len, g64);
+	} else {
+		/* Bitcoin path: handle donation and witness */
+		if (ckp->donvalid && ckp->donation > 0) {
+			double dbl64 = (double)g64 / 100 * ckp->donation;
 
-		wb->coinb3bin[wb->coinb3len++] = witnessdata_size + 2; // total scriptPubKey size
-		wb->coinb3bin[wb->coinb3len++] = 0x6a; // OP_RETURN
-		wb->coinb3bin[wb->coinb3len++] = witnessdata_size;
+			d64 = dbl64;
+			g64 -= d64; // To guarantee integers add up to the original coinbasevalue
+			wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
+		} else
+			wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
 
-		hex2bin(&wb->coinb3bin[wb->coinb3len], wb->witnessdata, witnessdata_size);
-		wb->coinb3len += witnessdata_size;
+		u64 = (uint64_t *)&wb->coinb2bin[wb->coinb2len];
+		*u64 = htole64(g64);
+		wb->coinb2len += 8;
+
+		/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
+
+		wb->coinb3len = 0;
+		wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
 	}
 
-	wb->coinb3len += 4; // Blank lock
+	/* Bitcoin-specific coinb3 processing (skip for Quai) */
+	if (!wb->payoutscript_bin || wb->payoutscript_len == 0) {
+		if (ckp->donvalid && ckp->donation > 0) {
+			u64 = (uint64_t *)wb->coinb3bin;
+			*u64 = htole64(d64);
+			wb->coinb3len += 8;
 
-	if (!ckp->btcsolo) {
+			wb->coinb3bin[wb->coinb3len++] = sdata->dontxnlen;
+			memcpy(wb->coinb3bin + wb->coinb3len, sdata->dontxnbin, sdata->dontxnlen);
+			wb->coinb3len += sdata->dontxnlen;
+		} else
+			ckp->donation = 0;
+
+		if (wb->insert_witness) {
+			// 0 value
+			wb->coinb3len += 8;
+
+			wb->coinb3bin[wb->coinb3len++] = witnessdata_size + 2; // total scriptPubKey size
+			wb->coinb3bin[wb->coinb3len++] = 0x6a; // OP_RETURN
+			wb->coinb3bin[wb->coinb3len++] = witnessdata_size;
+
+			hex2bin(&wb->coinb3bin[wb->coinb3len], wb->witnessdata, witnessdata_size);
+			wb->coinb3len += witnessdata_size;
+		}
+
+		wb->coinb3len += 4; // Blank lock
+	}
+
+	/* Bitcoin-specific output and validation handling (skip for Quai) */
+	if (wb->payoutscript_bin && wb->payoutscript_len > 0) {
+		/* Quai path: coinbase is already complete, skip validation for now */
+		ckp->coinbase_valid = true;
+		LOGNOTICE("Using Quai-supplied coinbaseaux and payoutscript");
+	} else if (!ckp->btcsolo) {
 		int coinbase_len, offset = 0;
 		char *coinbase, *cb;
 		json_t *val = NULL;
@@ -1001,14 +1122,26 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 	sdata->userwbs_generated++;
 	userwb = ckzalloc(sizeof(struct userwb));
 	userwb->id = id;
-	userwb->coinb2bin = ckalloc(wb->coinb2len + 1 + user->txnlen + wb->coinb3len);
-	memcpy(userwb->coinb2bin, wb->coinb2bin, wb->coinb2len);
-	userwb->coinb2len = wb->coinb2len;
-	userwb->coinb2bin[userwb->coinb2len++] = user->txnlen;
-	memcpy(userwb->coinb2bin + userwb->coinb2len, user->txnbin, user->txnlen);
-	userwb->coinb2len += user->txnlen;
-	memcpy(userwb->coinb2bin + userwb->coinb2len, wb->coinb3bin, wb->coinb3len);
-	userwb->coinb2len += wb->coinb3len;
+
+	/* For Quai (payoutscript_bin set), don't add user txn data - payout already in coinbase */
+	if (wb->payoutscript_bin) {
+		/* Simple case: just copy coinb2 + coinb3 with no user txn */
+		userwb->coinb2bin = ckalloc(wb->coinb2len + wb->coinb3len);
+		memcpy(userwb->coinb2bin, wb->coinb2bin, wb->coinb2len);
+		userwb->coinb2len = wb->coinb2len;
+		memcpy(userwb->coinb2bin + userwb->coinb2len, wb->coinb3bin, wb->coinb3len);
+		userwb->coinb2len += wb->coinb3len;
+	} else {
+		/* Standard Bitcoin: add user txn data between coinb2 and coinb3 */
+		userwb->coinb2bin = ckalloc(wb->coinb2len + 1 + user->txnlen + wb->coinb3len);
+		memcpy(userwb->coinb2bin, wb->coinb2bin, wb->coinb2len);
+		userwb->coinb2len = wb->coinb2len;
+		userwb->coinb2bin[userwb->coinb2len++] = user->txnlen;
+		memcpy(userwb->coinb2bin + userwb->coinb2len, user->txnbin, user->txnlen);
+		userwb->coinb2len += user->txnlen;
+		memcpy(userwb->coinb2bin + userwb->coinb2len, wb->coinb3bin, wb->coinb3len);
+		userwb->coinb2len += wb->coinb3len;
+	}
 	userwb->coinb2 = bin2hex(userwb->coinb2bin, userwb->coinb2len);
 	HASH_ADD_I64(user->userwbs, id, userwb);
 }
@@ -1108,6 +1241,7 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 
 	/* This wb can't be pulled out from under us so no workbase lock is
 	 * required to generate_userwbs */
+	/* Generate userwbs for btcsolo. For Quai, user->txnlen is 0 so no extra data added */
 	if (ckp->btcsolo)
 		generate_userwbs(sdata, wb);
 
@@ -2040,6 +2174,8 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	int txns = wb->txns + 1;
 	char hexcoinbase[1024];
 
+	LOGNOTICE("process_block: cblen=%d", cblen);
+
 	flip_32(flip32, hash);
 	__bin2hex(blockhash, flip32, 32);
 
@@ -2063,6 +2199,7 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	}
 	strcat(gbt_block, varint);
 	__bin2hex(hexcoinbase, coinbase, cblen);
+	LOGNOTICE("process_block: coinbase_len=%d coinbase_hex=%s", cblen, hexcoinbase);
 	strcat(gbt_block, hexcoinbase);
 	if (wb->txns)
 		realloc_strcat(&gbt_block, wb->txn_data);
@@ -3387,6 +3524,8 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 		server = 0;
 	client->server = server;
 	client->diff = client->old_diff = ckp->startdiff;
+	LOGNOTICE("Client %ld: Set initial diff to %ld from ckp->startdiff=%ld",
+		  id, client->diff, ckp->startdiff);
 	if (ckp->server_highdiff && ckp->server_highdiff[server]) {
 		client->suggest_diff = ckp->highdiff;
 		if (client->suggest_diff > client->diff)
@@ -4697,7 +4836,7 @@ static void *blockupdate(void *arg)
 					update_base(sdata, GEN_PRIORITY);
 					break;
 				}
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case GETBEST_FAILED:
 			default:
 				cksleep_ms(ckp->blockpoll);
@@ -5034,22 +5173,22 @@ static double dsps_from_key(json_t *val, const char *key)
 		switch (endptr[0]) {
 			case 'E':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case 'P':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case 'T':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case 'G':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case 'M':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			case 'K':
 				ret *= (double)1000;
-				[[fallthrough]];
+				__attribute__((fallthrough));
 			default:
 				break;
 		}
@@ -5377,10 +5516,16 @@ static user_instance_t *generate_user(ckpool_t *ckp, stratum_instance_t *client,
 	ck_wunlock(&sdata->instance_lock);
 
 	if (!ckp->proxy && (new_user || !user->btcaddress)) {
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+		/* Skip address validation for btcsolo - Quai provides coinbase */
+		if (ckp->btcsolo) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			LOGDEBUG("btcsolo mode: accepting username %s without validation", username);
+		} else {
+			/* Is this a btc address based username? */
+			if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+				user->btcaddress = true;
+				user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			}
 		}
 	}
 	if (new_user) {
@@ -5545,6 +5690,7 @@ out:
 		ck_wunlock(&sdata->workbase_lock);
 
 		ck_wlock(&sdata->instance_lock);
+		/* Generate userwb for this user. For Quai, user->txnlen is 0 so no extra data added */
 		__generate_userwb(sdata, wb, user);
 		ck_wunlock(&sdata->instance_lock);
 
@@ -5564,6 +5710,7 @@ static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
 {
 	json_t *json_msg;
 
+	LOGNOTICE("Sending difficulty %ld to client %ld", client->diff, client->id);
 	JSON_CPACK(json_msg, "{s[I]soss}", "params", client->diff, "id", json_null(),
 			     "method", "mining.set_difficulty");
 	stratum_add_send(sdata, json_msg, client->id, SM_DIFF);
@@ -5756,10 +5903,17 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	ts_t ts_now;
 	bool ret;
 
-	/* Submit anything over 99.9% of the diff in case of rounding errors */
-	network_diff = sdata->current_workbase->network_diff * 0.999;
-	if (likely(diff < network_diff))
-		return;
+	/* For Quai (btcsolo), submit any share that meets share difficulty
+	 * For standard pools, submit anything over 99.9% of network diff */
+	if (ckp->btcsolo) {
+		/* Quai: submit if share meets the client's difficulty */
+		if (likely(diff < client->diff * 0.999))
+			return;
+	} else {
+		network_diff = sdata->current_workbase->network_diff * 0.999;
+		if (likely(diff < network_diff))
+			return;
+	}
 
 	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
 	/* Can't submit a block in proxy mode without the transactions */
@@ -5861,12 +6015,22 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 
 	ck_rlock(&sdata->instance_lock);
 	coinb2bin = __user_coinb2(client, wb, &cb2len);
+	LOGNOTICE("Building coinbase: coinb1len=%d enonce1=%d enonce2=%d coinb2len=%d total=%d",
+		wb->coinb1len, wb->enonce1constlen + wb->enonce1varlen, wb->enonce2varlen,
+		cb2len, cblen + cb2len);
 	memcpy(coinbase + cblen, coinb2bin, cb2len);
 	ck_runlock(&sdata->instance_lock);
 
 	cblen += cb2len;
 
 	gen_hash((uchar *)coinbase, merkle_root, cblen);
+	char *cb_hex = bin2hex(coinbase, cblen);
+	char *mr_hex = bin2hex(merkle_root, 32);
+	LOGNOTICE("Hashing coinbase: len=%d hex=%s", cblen, cb_hex);
+	LOGNOTICE("Merkle root from coinbase: %s", mr_hex);
+	free(cb_hex);
+	free(mr_hex);
+
 	memcpy(merkle_sha, merkle_root, 32);
 	for (i = 0; i < wb->merkles; i++) {
 		memcpy(merkle_sha + 32, &wb->merklebin[i], 32);
@@ -5876,6 +6040,10 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	data32 = (uint32_t *)merkle_sha;
 	swap32 = (uint32_t *)merkle_root;
 	flip_32(swap32, data32);
+
+	char *mr_flipped_hex = bin2hex(merkle_root, 32);
+	LOGNOTICE("Merkle root (byte-flipped for header): %s", mr_flipped_hex);
+	free(mr_flipped_hex);
 
 	/* Copy the cached header binary and insert the merkle root */
 	memcpy(data, wb->headerbin, 80);
@@ -5906,6 +6074,7 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 
 	/* Calculate the diff of the share here */
 	ret = diff_from_target(hash);
+	LOGNOTICE("PoW verified: share difficulty = %.6f", ret);
 
 	/* Test we haven't solved a block regardless of share status */
 	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32, version_mask, stale);
@@ -6864,10 +7033,16 @@ static user_instance_t *generate_remote_user(ckpool_t *ckp, const char *workerna
 	user = get_create_user(sdata, username, &new_user);
 
 	if (!ckp->proxy && (new_user || !user->btcaddress)) {
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+		/* Skip address validation for btcsolo - Quai provides coinbase */
+		if (ckp->btcsolo) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			LOGDEBUG("btcsolo mode: accepting username %s without validation", username);
+		} else {
+			/* Is this a btc address based username? */
+			if (generator_checkaddr(ckp, username, &user->script, &user->segwit)) {
+				user->btcaddress = true;
+				user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			}
 		}
 	}
 	if (new_user) {
@@ -8534,32 +8709,43 @@ void *stratifier(void *arg)
 		cksleep_ms(10);
 
 	if (!ckp->proxy) {
-		if (!generator_checkaddr(ckp, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
-			LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
-			goto out;
+		/* Skip address validation for btcsolo mode - Quai node provides coinbase */
+		if (!ckp->btcsolo) {
+			if (!generator_checkaddr(ckp, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
+				LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
+				goto out;
+			}
+
+			/* Store this for use elsewhere */
+			hex2bin(scriptsig_header_bin, scriptsig_header, 41);
+			sdata->txnlen = address_to_txn(sdata->txnbin, ckp->btcaddress, ckp->script, ckp->segwit);
+		} else {
+			LOGNOTICE("Skipping address validation for btcsolo mode (Quai provides coinbase)");
+			/* Skip coinbase validation since Quai provides it */
+			ckp->coinbase_valid = true;
+			/* But still need to initialize scriptsig_header_bin for coinbase construction */
+			hex2bin(scriptsig_header_bin, scriptsig_header, 41);
 		}
 
-		/* Store this for use elsewhere */
-		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckp->btcaddress, ckp->script, ckp->segwit);
-
-		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckp, ckp->donaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC donation address valid %s", ckp->donaddress);
-		} else if (generator_checkaddr(ckp, ckp->tndonaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donaddress = ckp->tndonaddress;
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC testnet donation address valid %s", ckp->donaddress);
-		} else if (generator_checkaddr(ckp, ckp->rtdonaddress, &ckp->donscript, &ckp->donsegwit)) {
-			ckp->donaddress = ckp->rtdonaddress;
-			ckp->donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC regtest donation address valid %s", ckp->donaddress);
-		} else
-			LOGNOTICE("No valid donation address found");
+		/* Find a valid donation address if possible - skip for btcsolo */
+		if (!ckp->btcsolo) {
+			if (generator_checkaddr(ckp, ckp->donaddress, &ckp->donscript, &ckp->donsegwit)) {
+				ckp->donvalid = true;
+				sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
+				LOGNOTICE("BTC donation address valid %s", ckp->donaddress);
+			} else if (generator_checkaddr(ckp, ckp->tndonaddress, &ckp->donscript, &ckp->donsegwit)) {
+				ckp->donaddress = ckp->tndonaddress;
+				ckp->donvalid = true;
+				sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
+				LOGNOTICE("BTC testnet donation address valid %s", ckp->donaddress);
+			} else if (generator_checkaddr(ckp, ckp->rtdonaddress, &ckp->donscript, &ckp->donsegwit)) {
+				ckp->donaddress = ckp->rtdonaddress;
+				ckp->donvalid = true;
+				sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
+				LOGNOTICE("BTC regtest donation address valid %s", ckp->donaddress);
+			} else
+				LOGNOTICE("No valid donation address found");
+		}
 	}
 
 	randomiser = time(NULL);

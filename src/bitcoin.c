@@ -113,14 +113,14 @@ out:
 	return val;
 }
 
-static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
+static const char *gbt_req = "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_getBlockTemplate\", \"params\": [{\"rules\": [\"sha\"]}]}\n";
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
  * required to assemble a mining template, storing it in a gbtbase_t structure */
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 {
-	json_t *rules_array, *coinbase_aux, *res_val, *val;
+	json_t *rules_array, *res_val, *val;
 	const char *previousblockhash;
 	char hash_swap[32], tmp[32];
 	uint64_t coinbasevalue;
@@ -136,12 +136,20 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	val = json_rpc_call(cs, gbt_req);
 	if (!val) {
-		LOGWARNING("%s:%s Failed to get valid json response to getblocktemplate", cs->url, cs->port);
+		LOGWARNING("%s:%s Failed to get valid json response to quai_getBlockTemplate", cs->url, cs->port);
 		return ret;
 	}
+
+	/* Log the full JSON response from quai_getBlockTemplate */
+	char *json_str = json_dumps(val, JSON_INDENT(2) | JSON_PRESERVE_ORDER);
+	if (json_str) {
+		LOGNOTICE("quai_getBlockTemplate JSON response:\n%s", json_str);
+		free(json_str);
+	}
+
 	res_val = json_object_get(val, "result");
 	if (!res_val) {
-		LOGWARNING("Failed to get result in json response to getblocktemplate");
+		LOGWARNING("Failed to get result in json response to quai_getBlockTemplate");
 		goto out;
 	}
 
@@ -165,13 +173,45 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	bits = json_string_value(json_object_get(res_val, "bits"));
 	height = json_integer_value(json_object_get(res_val, "height"));
 	coinbasevalue = json_integer_value(json_object_get(res_val, "coinbasevalue"));
-	coinbase_aux = json_object_get(res_val, "coinbaseaux");
-	flags = json_string_value(json_object_get(coinbase_aux, "flags"));
-	if (!flags)
-		flags = "";
 
-	if (unlikely(!previousblockhash || !target || !version || !curtime || !bits || !coinbase_aux)) {
-		LOGERR("JSON failed to decode GBT %s %s %d %d %s %s", previousblockhash, target, version, curtime, bits, flags);
+	/* Parse Quai-specific coinbaseaux and payoutscript */
+	const char *coinbaseaux_str = json_string_value(json_object_get(res_val, "coinbaseaux"));
+	const char *payoutscript_str = json_string_value(json_object_get(res_val, "payoutscript"));
+
+	/* Strip 0x prefix if present */
+	if (coinbaseaux_str && strncmp(coinbaseaux_str, "0x", 2) == 0)
+		coinbaseaux_str += 2;
+	if (payoutscript_str && strncmp(payoutscript_str, "0x", 2) == 0)
+		payoutscript_str += 2;
+
+	if (coinbaseaux_str && strlen(coinbaseaux_str) > 0) {
+		gbt->coinbaseaux = strdup(coinbaseaux_str);
+		gbt->coinbaseaux_len = strlen(coinbaseaux_str) / 2;
+		gbt->coinbaseaux_bin = ckalloc(gbt->coinbaseaux_len);
+		hex2bin(gbt->coinbaseaux_bin, coinbaseaux_str, gbt->coinbaseaux_len);
+		LOGNOTICE("Parsed coinbaseaux: %d bytes", gbt->coinbaseaux_len);
+	} else {
+		gbt->coinbaseaux = NULL;
+		gbt->coinbaseaux_bin = NULL;
+		gbt->coinbaseaux_len = 0;
+	}
+
+	if (payoutscript_str && strlen(payoutscript_str) > 0) {
+		gbt->payoutscript = strdup(payoutscript_str);
+		gbt->payoutscript_len = strlen(payoutscript_str) / 2;
+		gbt->payoutscript_bin = ckalloc(gbt->payoutscript_len);
+		hex2bin(gbt->payoutscript_bin, payoutscript_str, gbt->payoutscript_len);
+		LOGNOTICE("Parsed payoutscript: %d bytes", gbt->payoutscript_len);
+	} else {
+		gbt->payoutscript = NULL;
+		gbt->payoutscript_bin = NULL;
+		gbt->payoutscript_len = 0;
+	}
+
+	flags = "";
+
+	if (unlikely(!previousblockhash || !target || !version || !curtime || !bits)) {
+		LOGERR("JSON failed to decode GBT %s %s %d %d %s", previousblockhash, target, version, curtime, bits);
 		goto out;
 	}
 
@@ -190,6 +230,10 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	bswap_256(tmp, hash_swap);
 	gbt->diff = diff_from_target((uchar *)tmp);
 	json_object_set_new_nocheck(gbt->json, "diff", json_real(gbt->diff));
+
+	/* Log parsed GBT fields */
+	LOGNOTICE("GBT: height=%d bits=%s network_diff=%.1f prevhash=...%s",
+		height, bits, gbt->diff, previousblockhash + 56);
 
 	gbt->version = version;
 
@@ -220,6 +264,10 @@ out:
 void clear_gbtbase(gbtbase_t *gbt)
 {
 	free(gbt->flags);
+	free(gbt->coinbaseaux);
+	free(gbt->coinbaseaux_bin);
+	free(gbt->payoutscript);
+	free(gbt->payoutscript_bin);
 	if (gbt->json)
 		json_decref(gbt->json);
 	memset(gbt, 0, sizeof(gbtbase_t));
@@ -291,6 +339,13 @@ bool get_bestblockhash(connsock_t *cs, char *hash)
 	const char *res_ret;
 	bool ret = false;
 
+	/* Skip for btcsolo mode - Quai provides previousblockhash in GBT */
+	if (cs->ckp && cs->ckp->btcsolo) {
+		/* Return dummy hash - not used in btcsolo */
+		strcpy(hash, "0000000000000000000000000000000000000000000000000000000000000000");
+		return true;
+	}
+
 	val = json_rpc_call(cs, bestblockhash_req);
 	if (!val) {
 		LOGWARNING("%s:%s Failed to get valid json response to getbestblockhash", cs->url, cs->port);
@@ -321,21 +376,27 @@ bool submit_block(connsock_t *cs, const char *params)
 	bool ret = false;
 	char *rpc_req;
 
-	len = strlen(params) + 64;
+	len = strlen(params) + 128;  // Increased buffer for JSON wrapper
 retry:
 	rpc_req = ckalloc(len);
-	sprintf(rpc_req, "{\"method\": \"submitblock\", \"params\": [\"%s\"]}\n", params);
+	sprintf(rpc_req, "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_submitBlock\", \"params\": [\"0x%s\"]}\n", params);
+	LOGNOTICE("Submitting block: 0x%s", params);
 	val = json_rpc_call(cs, rpc_req);
 	dealloc(rpc_req);
 	if (!val) {
-		LOGWARNING("%s:%s Failed to get valid json response to submitblock", cs->url, cs->port);
+		LOGWARNING("%s:%s Failed to get valid json response to quai_submitBlock", cs->url, cs->port);
 		if (++retries < 5)
 			goto retry;
 		return ret;
 	}
+	/* Log the full response for debugging */
+	char *response_str = json_dumps(val, JSON_INDENT(2));
+	LOGNOTICE("quai_submitBlock response: %s", response_str);
+	free(response_str);
+
 	res_val = json_object_get(val, "result");
 	if (!res_val) {
-		LOGWARNING("Failed to get result in json response to submitblock");
+		LOGWARNING("Failed to get result in json response to quai_submitBlock");
 		if (++retries < 5) {
 			json_decref(val);
 			goto retry;

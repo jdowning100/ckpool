@@ -790,15 +790,28 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
 		goto out;
 	}
 	http_req = ckalloc(len + 256); // Leave room for headers
-	sprintf(http_req,
-		 "POST / HTTP/1.1\n"
-		 "Authorization: Basic %s\n"
-		 "Host: %s:%s\n"
-		 "Content-type: application/json\n"
-		 "Content-Length: %d\n\n%s",
-		 cs->auth, cs->url, cs->port, len, rpc_req);
+	/* Only send Authorization header if auth is not empty (not just base64 of ":") */
+	if (cs->auth && strlen(cs->auth) > 0 && strcmp(cs->auth, "Og==") != 0) {
+		sprintf(http_req,
+			 "POST / HTTP/1.1\r\n"
+			 "Authorization: Basic %s\r\n"
+			 "Host: %s:%s\r\n"
+			 "Content-type: application/json\r\n"
+			 "Connection: close\r\n"
+			 "Content-Length: %d\r\n\r\n%s",
+			 cs->auth, cs->url, cs->port, len, rpc_req);
+	} else {
+		sprintf(http_req,
+			 "POST / HTTP/1.1\r\n"
+			 "Host: %s:%s\r\n"
+			 "Content-type: application/json\r\n"
+			 "Connection: close\r\n"
+			 "Content-Length: %d\r\n\r\n%s",
+			 cs->url, cs->port, len, rpc_req);
+	}
 
 	len = strlen(http_req);
+
 	tv_time(&stt_tv);
 	ret = write_socket(cs->fd, http_req, len);
 	if (ret != len) {
@@ -1482,6 +1495,19 @@ static void parse_config(ckpool_t *ckp)
 		ckp->donation = 0;
 	else if (ckp->donation > 99.9)
 		ckp->donation = 99.9;
+
+	/* Don't override difficulty settings for btcsolo mode - use config values
+	 * This allows proper difficulty settings for Quai solo mining */
+	if (ckp->btcsolo && !ckp->mindiff && !ckp->startdiff) {
+		/* Only set defaults if not specified in config */
+		ckp->mindiff = 1;
+		ckp->startdiff = 1;
+		LOGNOTICE("Solo mode: using default share difficulty of 1 (~4.29B hashes per share)");
+	} else if (ckp->btcsolo) {
+		LOGNOTICE("Solo mode: using configured share difficulty - mindiff=%ld startdiff=%ld",
+			ckp->mindiff, ckp->startdiff);
+	}
+
 	arr_val = json_object_get(json_conf, "proxy");
 	if (arr_val && json_is_array(arr_val)) {
 		arr_size = json_array_size(arr_val);

@@ -57,6 +57,14 @@ struct genwork {
 	char merklebin[16][32];
 	json_t *merkle_array;
 
+	/* Quai-specific fields from getBlockTemplate */
+	char *coinbaseaux;       // Pre-constructed scriptSig from go-quai (hex string)
+	uchar *coinbaseaux_bin;  // Binary version of coinbaseaux
+	int coinbaseaux_len;     // Length of binary coinbaseaux
+	char *payoutscript;      // scriptPubKey for coinbase output (hex string)
+	uchar *payoutscript_bin; // Binary version of payoutscript
+	int payoutscript_len;    // Length of binary payoutscript
+
 	/* Template variables, lengths are binary lengths! */
 	char *coinb1; // coinbase1
 	uchar *coinb1bin;

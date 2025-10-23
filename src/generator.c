@@ -254,19 +254,13 @@ static bool server_alive(ckpool_t *ckp, server_instance_t *si, bool pinging)
 	}
 	clear_gbtbase(&gbt);
 	if (unlikely(ckp->btcsolo && !ckp->btcaddress)) {
-		/* If no btcaddress is specified in solobtc mode, choose one of
-		 * the donation addresses from mainnet, testnet, or regtest for
-		 * coinbase validation later on, although it will not be used
-		 * for mining. */
-		if (validate_address(cs, ckp->donaddress, &ckp->script, &ckp->segwit))
-			ckp->btcaddress = ckp->donaddress;
-		else if (validate_address(cs, ckp->tndonaddress, &ckp->script, &ckp->segwit))
-			ckp->btcaddress = ckp->tndonaddress;
-		else if (validate_address(cs, ckp->rtdonaddress, &ckp->script, &ckp->segwit))
-			ckp->btcaddress = ckp->rtdonaddress;
+		/* Skip address validation for Quai - just use a dummy address */
+		ckp->btcaddress = "14BMjogz69qe8hk9thyzbmR5pg34mVKB1e";
+		LOGNOTICE("Using dummy address for Quai solo mining (node provides coinbase)");
 	}
 
-	if (!ckp->node && !validate_address(cs, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
+	/* Skip address validation for solo mode - Quai node provides the coinbase */
+	if (!ckp->node && !ckp->btcsolo && !validate_address(cs, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
 		LOGWARNING("Invalid btcaddress: %s !", ckp->btcaddress);
 		goto out;
 	}
