@@ -1627,19 +1627,45 @@ retry:
 
 	wb->ckp = ckp;
 
-	txn_array = json_object_get(wb->json, "transactions");
-	txns = wb_merkle_bin_txns(ckp, sdata, wb, txn_array, true);
+	/* We want header+coinbase only. Don't build Merkle from transactions. */
+	txns = NULL;  /* Initialize to NULL - we don't build transactions for Quai */
+	wb->txns = 0;
+	wb->txn_data = ckzalloc(1);   /* keep empty to serialize only coinbase */
+	wb->txn_hashes = ckzalloc(1);
+	wb->merkles = 0;
+	wb->merkle_array = json_array();
 
-	wb->insert_witness = false;
+	/* Consume merklebranch from the template (Quai) and build wb->merklebin[].
+	   IMPORTANT: CKPool's hashing expects the sibling bytes LE (little-endian),
+	   and concatenation order is (running_root || sibling).
+	   Miners also expect LE hex strings in mining.notify.
+	   So: BE hex → BE bytes → LE bytes → LE hex for miners */
+	{
+		json_t *branch = json_object_get(wb->json, "merklebranch");
+		if (branch && json_is_array(branch)) {
+			size_t idx;
+			json_t *it;
+			json_array_foreach(branch, idx, it) {
+				const char *s = json_string_value(it);
+				if (!s) continue;
+				if (s[0] == '0' && s[1] == 'x') s += 2;  /* strip 0x if present */
 
-	witnessdata_check = json_string_value(json_object_get(wb->json, "default_witness_commitment"));
-	if (likely(witnessdata_check)) {
-		LOGDEBUG("Default witness commitment present, adding witness data");
-		gbt_witness_data(wb, txn_array);
-		// Verify against the pre-calculated value if it exists. Skip the size/OP_RETURN bytes.
-		if (wb->insert_witness && safecmp(witnessdata_check + 4, wb->witnessdata) != 0)
-			LOGERR("Witness from btcd: %s. Calculated Witness: %s", witnessdata_check + 4, wb->witnessdata);
+				/* Convert BE string → BE bytes → LE bytes */
+				uchar be[32];
+				hex2bin((char *)be, s, 32);
+				bswap_256(&wb->merklebin[wb->merkles][0], (char *)be);
+
+				/* Store the LE hex string for mining.notify */
+				__bin2hex(&wb->merklehash[wb->merkles][0], &wb->merklebin[wb->merkles][0], 32);
+				json_array_append_new(wb->merkle_array, json_string(&wb->merklehash[wb->merkles][0]));
+
+				wb->merkles++;
+			}
+		}
 	}
+
+	/* No segwit witness commitment when we're not carrying full tx set */
+	wb->insert_witness = false;
 
 	generate_coinbase(ckp, wb);
 
@@ -3170,11 +3196,28 @@ static void update_notify(ckpool_t *ckp, const char *cmd)
 	wb->coinb2len = strlen(wb->coinb2) / 2;
 	wb->coinb2bin = ckalloc(wb->coinb2len);
 	hex2bin(wb->coinb2bin, wb->coinb2, wb->coinb2len);
-	wb->merkle_array = json_object_dup(val, "merklehash");
-	wb->merkles = json_array_size(wb->merkle_array);
+
+	/* Try merklehash first (ckpool format), then merklebranch (Bitcoin GBT standard) */
+	json_t *merkle_source = json_object_get(val, "merklehash");
+	if (!merkle_source)
+		merkle_source = json_object_get(val, "merklebranch");
+
+	wb->merkle_array = json_array();  /* Will store LE hex for miners */
+	wb->merkles = json_array_size(merkle_source);
 	for (i = 0; i < wb->merkles; i++) {
-		strcpy(&wb->merklehash[i][0], json_string_value(json_array_get(wb->merkle_array, i)));
-		hex2bin(&wb->merklebin[i][0], &wb->merklehash[i][0], 32);
+		const char *hash_str = json_string_value(json_array_get(merkle_source, i));
+		/* Skip 0x prefix if present (Quai format) */
+		if (hash_str && hash_str[0] == '0' && hash_str[1] == 'x')
+			hash_str += 2;
+
+		/* Convert BE hex → BE bytes → LE bytes */
+		uchar be[32];
+		hex2bin((char *)be, hash_str, 32);
+		bswap_256(&wb->merklebin[i][0], (char *)be);
+
+		/* Store LE hex for mining.notify */
+		__bin2hex(&wb->merklehash[i][0], &wb->merklebin[i][0], 32);
+		json_array_append_new(wb->merkle_array, json_string(&wb->merklehash[i][0]));
 	}
 	json_strcpy(wb->bbversion, val, "bbversion");
 	json_strcpy(wb->nbit, val, "nbit");
@@ -6037,6 +6080,11 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 		gen_hash(merkle_sha, merkle_root, 64);
 		memcpy(merkle_sha, merkle_root, 32);
 	}
+
+	char *mr_final = bin2hex(merkle_root, 32);
+	LOGNOTICE("Merkle final after applying %d branches (LE bytes): %s", wb->merkles, mr_final);
+	free(mr_final);
+
 	data32 = (uint32_t *)merkle_sha;
 	swap32 = (uint32_t *)merkle_root;
 	flip_32(swap32, data32);
@@ -6066,11 +6114,24 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	*data32 = htobe32(ntime32);
 
 	/* Hash the share */
+	char *data_hex = bin2hex(data, 80);
+	LOGNOTICE("Block header BEFORE flip_80 (internal byte order): %s", data_hex);
+	free(data_hex);
+
 	data32 = (uint32_t *)data;
 	swap32 = (uint32_t *)swap;
 	flip_80(swap32, data32);
+
+	char *header_hex = bin2hex(swap, 80);
+	LOGNOTICE("Block header AFTER flip_80 (for SHA256 hashing): %s", header_hex);
+	free(header_hex);
+
 	sha256(swap, 80, hash1);
 	sha256(hash1, 32, hash);
+
+	char *hash_hex = bin2hex(hash, 32);
+	LOGNOTICE("Share hash (LE): %s", hash_hex);
+	free(hash_hex);
 
 	/* Calculate the diff of the share here */
 	ret = diff_from_target(hash);
