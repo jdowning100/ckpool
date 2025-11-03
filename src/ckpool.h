@@ -164,6 +164,9 @@ struct ckpool_instance {
 	/* How many clients maximum to accept before rejecting further */
 	int maxclients;
 
+	/* Port to listen on for stratum connections */
+	int port;
+
 	/* API message queue */
 	ckmsgq_t *ckpapi;
 
@@ -206,6 +209,9 @@ struct ckpool_instance {
 
 	/* Are we running in btcsolo mode */
 	bool btcsolo;
+
+	/* Use Scrypt algorithm instead of SHA256d */
+	bool scrypt_algo;
 
 	/* Are we running in userproxy mode */
 	bool userproxy;

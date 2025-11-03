@@ -113,12 +113,13 @@ out:
 	return val;
 }
 
-static const char *gbt_req = "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_getBlockTemplate\", \"params\": [{\"rules\": [\"sha\"]}]}\n";
+static const char *gbt_req_sha = "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_getBlockTemplate\", \"params\": [{\"rules\": [\"sha\"]}]}\n";
+static const char *gbt_req_scrypt = "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_getBlockTemplate\", \"params\": [{\"rules\": [\"scrypt\"]}]}\n";
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
  * required to assemble a mining template, storing it in a gbtbase_t structure */
-bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
+bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt, bool scrypt_algo)
 {
 	json_t *rules_array, *res_val, *val;
 	const char *previousblockhash;
@@ -134,6 +135,8 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	int i;
 	bool ret = false;
 
+	/* Use appropriate GBT request based on algorithm */
+	const char *gbt_req = scrypt_algo ? gbt_req_scrypt : gbt_req_sha;
 	val = json_rpc_call(cs, gbt_req);
 	if (!val) {
 		LOGWARNING("%s:%s Failed to get valid json response to quai_getBlockTemplate", cs->url, cs->port);
@@ -174,39 +177,28 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	height = json_integer_value(json_object_get(res_val, "height"));
 	coinbasevalue = json_integer_value(json_object_get(res_val, "coinbasevalue"));
 
-	/* Parse Quai-specific coinbaseaux and payoutscript */
-	const char *coinbaseaux_str = json_string_value(json_object_get(res_val, "coinbaseaux"));
-	const char *payoutscript_str = json_string_value(json_object_get(res_val, "payoutscript"));
-
-	/* Strip 0x prefix if present */
-	if (coinbaseaux_str && strncmp(coinbaseaux_str, "0x", 2) == 0)
-		coinbaseaux_str += 2;
-	if (payoutscript_str && strncmp(payoutscript_str, "0x", 2) == 0)
-		payoutscript_str += 2;
-
-	if (coinbaseaux_str && strlen(coinbaseaux_str) > 0) {
-		gbt->coinbaseaux = strdup(coinbaseaux_str);
-		gbt->coinbaseaux_len = strlen(coinbaseaux_str) / 2;
-		gbt->coinbaseaux_bin = ckalloc(gbt->coinbaseaux_len);
-		hex2bin(gbt->coinbaseaux_bin, coinbaseaux_str, gbt->coinbaseaux_len);
-		LOGNOTICE("Parsed coinbaseaux: %d bytes", gbt->coinbaseaux_len);
-	} else {
-		gbt->coinbaseaux = NULL;
-		gbt->coinbaseaux_bin = NULL;
-		gbt->coinbaseaux_len = 0;
+	/* New: Stratum-style pieces straight from Quai GBT */
+	const char *coinb1 = json_string_value(json_object_get(res_val, "coinb1"));
+	const char *coinb2 = json_string_value(json_object_get(res_val, "coinb2"));
+	int en1 = json_integer_value(json_object_get(res_val, "extranonce1Length"));
+	int en2 = json_integer_value(json_object_get(res_val, "extranonce2Length"));
+	if (!coinb1 || !coinb2) {
+		LOGERR("GBT missing coinb1/coinb2 – cannot build coinbase");
+		goto out;
 	}
+	/* Persist helper lengths; default to 4/8 if absent */
+	if (!en1) en1 = 4;
+	if (!en2) en2 = 8;
+	json_object_set_new_nocheck(res_val, "coinb1len", json_integer((int)strlen(coinb1) / 2));
+	json_object_set_new_nocheck(res_val, "coinb2len", json_integer((int)strlen(coinb2) / 2));
+	json_object_set_new_nocheck(res_val, "extranonce1Length", json_integer(en1));
+	json_object_set_new_nocheck(res_val, "extranonce2Length", json_integer(en2));
 
-	if (payoutscript_str && strlen(payoutscript_str) > 0) {
-		gbt->payoutscript = strdup(payoutscript_str);
-		gbt->payoutscript_len = strlen(payoutscript_str) / 2;
-		gbt->payoutscript_bin = ckalloc(gbt->payoutscript_len);
-		hex2bin(gbt->payoutscript_bin, payoutscript_str, gbt->payoutscript_len);
-		LOGNOTICE("Parsed payoutscript: %d bytes", gbt->payoutscript_len);
-	} else {
-		gbt->payoutscript = NULL;
-		gbt->payoutscript_bin = NULL;
-		gbt->payoutscript_len = 0;
-	}
+	/* Store coinb1 and coinb2 hex strings in gbt structure for change detection */
+	gbt->coinb1len = strlen(coinb1) / 2;
+	gbt->coinb1 = strdup(coinb1);
+	gbt->coinb2len = strlen(coinb2) / 2;
+	gbt->coinb2 = strdup(coinb2);
 
 	flags = "";
 
@@ -228,12 +220,12 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	hex2bin(hash_swap, target, 32);
 	bswap_256(tmp, hash_swap);
-	gbt->diff = diff_from_target((uchar *)tmp);
+	if (scrypt_algo)
+		gbt->diff = diff_from_target_scrypt((uchar *)tmp);
+	else
+		gbt->diff = diff_from_target((uchar *)tmp);
 	json_object_set_new_nocheck(gbt->json, "diff", json_real(gbt->diff));
 
-	/* Log parsed GBT fields */
-	LOGNOTICE("GBT: height=%d bits=%s network_diff=%.1f prevhash=...%s",
-		height, bits, gbt->diff, previousblockhash + 56);
 
 	gbt->version = version;
 
@@ -368,35 +360,36 @@ out:
 	return ret;
 }
 
-bool submit_block(connsock_t *cs, const char *params)
+bool submit_block(connsock_t *cs, const char *params, bool scrypt_algo)
 {
 	json_t *val, *res_val;
 	int len, retries = 0;
 	const char *res_ret;
 	bool ret = false;
 	char *rpc_req;
+	const char *method = scrypt_algo ? "quai_submitScryptBlock" : "quai_submitShaBlock";
 
-	len = strlen(params) + 128;  // Increased buffer for JSON wrapper
+	len = strlen(params) + 150;  // Increased buffer for JSON wrapper and method name
 retry:
 	rpc_req = ckalloc(len);
-	sprintf(rpc_req, "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"quai_submitBlock\", \"params\": [\"0x%s\"]}\n", params);
-	LOGNOTICE("Submitting block: 0x%s", params);
+	sprintf(rpc_req, "{\"jsonrpc\": \"2.0\", \"id\": \"0\", \"method\": \"%s\", \"params\": [\"0x%s\"]}\n", method, params);
+	LOGNOTICE("Submitting %s block: 0x%s", scrypt_algo ? "Scrypt" : "SHA256", params);
 	val = json_rpc_call(cs, rpc_req);
 	dealloc(rpc_req);
 	if (!val) {
-		LOGWARNING("%s:%s Failed to get valid json response to quai_submitBlock", cs->url, cs->port);
+		LOGWARNING("%s:%s Failed to get valid json response to %s", cs->url, cs->port, method);
 		if (++retries < 5)
 			goto retry;
 		return ret;
 	}
 	/* Log the full response for debugging */
 	char *response_str = json_dumps(val, JSON_INDENT(2));
-	LOGNOTICE("quai_submitBlock response: %s", response_str);
+	LOGNOTICE("%s response: %s", method, response_str);
 	free(response_str);
 
 	res_val = json_object_get(val, "result");
 	if (!res_val) {
-		LOGWARNING("Failed to get result in json response to quai_submitBlock");
+		LOGWARNING("Failed to get result in json response to %s", method);
 		if (++retries < 5) {
 			json_decref(val);
 			goto retry;

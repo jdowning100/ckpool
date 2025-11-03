@@ -215,7 +215,7 @@ static bool server_alive(ckpool_t *ckp, server_instance_t *si, bool pinging)
 	char *userpass = NULL;
 	bool ret = false;
 	connsock_t *cs;
-	gbtbase_t gbt;
+	gbtbase_t gbt = {0};  /* Zero-initialize to avoid garbage in unused fields */
 	int fd;
 
 	if (si->alive)
@@ -245,7 +245,7 @@ static bool server_alive(ckpool_t *ckp, server_instance_t *si, bool pinging)
 	}
 
 	/* Test we can connect, authorise and get a block template */
-	if (!gen_gbtbase(cs, &gbt)) {
+	if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo)) {
 		if (!pinging) {
 			LOGINFO("Failed to get test block template from %s:%s!",
 				cs->url, cs->port);
@@ -354,7 +354,7 @@ bool generator_submitblock(ckpool_t *ckp, const char *buf)
 	}
 	cs = &si->cs;
 	LOGNOTICE("Submitting block data!");
-	return submit_block(cs, buf);
+	return submit_block(cs, buf, ckp->scrypt_algo);
 }
 
 void generator_preciousblock(ckpool_t *ckp, const char *hash)
@@ -427,7 +427,7 @@ retry:
 	buf = umsg->buf;
 	LOGDEBUG("Generator received request: %s", buf);
 	if (cmdmatch(buf, "getbase")) {
-		if (!gen_gbtbase(cs, &gbt)) {
+		if (!gen_gbtbase(cs, &gbt, ckp->scrypt_algo)) {
 			LOGWARNING("Failed to get block template from %s:%s",
 				   cs->url, cs->port);
 			si->alive = cs->alive = false;
@@ -476,7 +476,7 @@ retry:
 		bool ret;
 
 		LOGNOTICE("Submitting block data!");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1, ckp->scrypt_algo);
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckp->stratifier, blockmsg);
@@ -870,7 +870,7 @@ struct genwork *generator_getbase(ckpool_t *ckp)
 	}
 	cs = &si->cs;
 	gbt = ckzalloc(sizeof(gbtbase_t));
-	if (unlikely(!gen_gbtbase(cs, gbt))) {
+	if (unlikely(!gen_gbtbase(cs, gbt, ckp->scrypt_algo))) {
 		LOGWARNING("Failed to get block template from %s:%s", cs->url, cs->port);
 		si->alive = cs->alive = false;
 		reconnect_generator(ckp);
@@ -3236,7 +3236,7 @@ retry:
 		bool ret;
 
 		LOGNOTICE("Submitting likely block solve share from upstream pool");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1, ckp->scrypt_algo);
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckp->stratifier, blockmsg);

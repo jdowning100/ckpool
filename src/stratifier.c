@@ -28,6 +28,9 @@
 #include "libckpool.h"
 #include "bitcoin.h"
 #include "sha2.h"
+
+/* For Scrypt support */
+#include <openssl/evp.h>
 #include "stratifier.h"
 #include "uthash.h"
 #include "utlist.h"
@@ -202,6 +205,24 @@ typedef struct stratifier_data sdata_t;
 
 typedef struct proxy_base proxy_t;
 
+/* Scrypt implementation for Litecoin-style mining
+ * header: 80-byte block header
+ * hdrLen: should be 80
+ * out32: 32-byte output hash
+ * Returns true on success, false on failure */
+static bool scrypt_1024_1_1_256(const uint8_t* header, size_t hdrLen, uint8_t out32[32]) {
+	/* Litecoin parameters: N=1024, r=1, p=1
+	 * Use header as both password and salt */
+	int ret = EVP_PBE_scrypt(
+		(const char*)header, hdrLen,  /* password */
+		header, hdrLen,                /* salt */
+		1024, 1, 1,                    /* N, r, p */
+		0,                             /* maxmem (0 = default) */
+		out32, 32                      /* output buffer and length */
+	);
+	return (ret == 1);
+}
+
 /* Per client stratum instance == workers */
 struct stratum_instance {
 	UT_hash_handle hh;
@@ -238,6 +259,8 @@ struct stratum_instance {
 	int64_t diff; /* Current diff */
 	int64_t old_diff; /* Previous diff */
 	int64_t diff_change_job_id; /* Last job_id we changed diff */
+	char target[68]; /* Current target (hex string) from workbase */
+	char old_target[68]; /* Previous target (hex string) */
 
 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
 
@@ -531,6 +554,65 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	char header[272];
 	int len, ofs = 0;
 	ts_t now;
+
+	/* If Quai GBT provided coinb1/coinb2, use them verbatim */
+	const char *coinb1_str = wb->json ? json_string_value(json_object_get(wb->json, "coinb1")) : NULL;
+	const char *coinb2_str = wb->json ? json_string_value(json_object_get(wb->json, "coinb2")) : NULL;
+	if (coinb1_str && coinb2_str) {
+		LOGNOTICE("generate_coinbase: wb has %d merkles already parsed", wb->merkles);
+		int en1 = 0, en2 = 0;
+		json_get_int(&en1, wb->json, "extranonce1Length");
+		json_get_int(&en2, wb->json, "extranonce2Length");
+		if (!en1) en1 = 4;
+		if (!en2) en2 = 8;
+		wb->enonce1constlen = 0;            /* do not prefill; miner/pool inserts bytes */
+		wb->enonce1varlen   = en1;
+		wb->enonce2varlen   = en2;
+
+		/* Strip 0x prefix if present */
+		if (strncmp(coinb1_str, "0x", 2) == 0)
+			coinb1_str += 2;
+		if (strncmp(coinb2_str, "0x", 2) == 0)
+			coinb2_str += 2;
+
+		wb->coinb1len = (int)strlen(coinb1_str) / 2;
+		wb->coinb1    = ckalloc(strlen(coinb1_str) + 1);
+		strcpy(wb->coinb1, coinb1_str);
+		wb->coinb1bin = ckalloc(wb->coinb1len);
+		hex2bin(wb->coinb1bin, wb->coinb1, wb->coinb1len);
+
+		wb->coinb2len = (int)strlen(coinb2_str) / 2;
+		wb->coinb2    = ckalloc(strlen(coinb2_str) + 1);
+		strcpy(wb->coinb2, coinb2_str);
+		wb->coinb2bin = ckalloc(wb->coinb2len);
+		hex2bin(wb->coinb2bin, wb->coinb2, wb->coinb2len);
+
+		/* Mark that we're using supplied coinb1/coinb2 to prevent legacy builder */
+		wb->coinb_parts_supplied = true;
+
+		LOGNOTICE("Using Quai-supplied coinb1/coinb2 (lens %d/%d). No pool-side mutations will be applied.",
+			  wb->coinb1len, wb->coinb2len);
+		LOGDEBUG("Coinb1: %s", wb->coinb1);
+		LOGDEBUG("Coinb2: %s", wb->coinb2);
+
+		/* Ensure merkle_array is initialized (should be set by caller before generate_coinbase) */
+		if (!wb->merkle_array) {
+			LOGWARNING("merkle_array not initialized, creating empty array");
+			wb->merkle_array = json_array();
+		}
+
+		/* Build the header template shell (same as legacy branch) */
+		snprintf(header, 270, "%s%s%s%s%s%s%s",
+			 wb->bbversion, wb->prevhash,
+			 "0000000000000000000000000000000000000000000000000000000000000000",
+			 wb->ntime, wb->nbit,
+			 "00000000", /* nonce */
+			 workpadding);
+		header[224] = 0;
+		LOGDEBUG("Header: %s", header);
+		hex2bin(wb->headerbin, header, 112);
+		return; /* done: skip legacy construction below */
+	}
 
 	/* Set fixed length coinb1 arrays to be more than enough */
 	wb->coinb1 = ckzalloc(256);
@@ -868,6 +950,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, bool clean);
 static void stratum_broadcast_updates(sdata_t *sdata, bool clean);
+static void stratum_send_update(sdata_t *sdata, const int64_t client_id, const bool clean);
+static bool validate_merkle_root(const workbase_t *wb, const char *coinbase, int cblen, const uchar *header);
 
 static void clear_userwb(sdata_t *sdata, int64_t id)
 {
@@ -1123,8 +1207,8 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 	userwb = ckzalloc(sizeof(struct userwb));
 	userwb->id = id;
 
-	/* For Quai (payoutscript_bin set), don't add user txn data - payout already in coinbase */
-	if (wb->payoutscript_bin) {
+	/* For Quai (coinb_parts_supplied or payoutscript_bin set), don't add user txn data - payout already in coinbase */
+	if (wb->coinb_parts_supplied || wb->payoutscript_bin) {
 		/* Simple case: just copy coinb2 + coinb3 with no user txn */
 		userwb->coinb2bin = ckalloc(wb->coinb2len + wb->coinb3len);
 		memcpy(userwb->coinb2bin, wb->coinb2bin, wb->coinb2len);
@@ -1170,9 +1254,17 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 	int len, ret;
 
 	ts_realtime(&wb->gentime);
-	/* Stats network_diff is not protected by lock but is not a critical
-	 * value */
-	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+    /* Stats network_diff is not protected by lock but is not a critical
+     * value. For Scrypt, prefer the explicit target-derived share_diff
+     * from GBT if present; fall back to nbits if needed. */
+    if (wb->scrypt_algo) {
+        if (wb->share_diff > 0)
+            wb->network_diff = wb->share_diff;
+        else
+            wb->network_diff = diff_from_nbits_scrypt(wb->headerbin + 72);
+    } else {
+        wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+    }
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;
@@ -1206,7 +1298,7 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 		if (unlikely(ret && errno != EEXIST))
 			LOGERR("Failed to create log directory %s", wb->logdir);
 	}
-	sprintf(wb->idstring, "%016lx", wb->id);
+	sprintf(wb->idstring, "%08x", (uint32_t)(wb->id & 0xFFFFFFFF));
 	if (ckp->logshares)
 		sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
 
@@ -1611,12 +1703,17 @@ static void block_update(ckpool_t *ckp, int *prio)
 	txntable_t *txns;
 	int retries = 0;
 	workbase_t *wb;
+	static char last_prevhash[68] = {0};
+	static char last_coinb1[512] = {0};
+	static int last_merkle_count = -1;
 
 retry:
 	wb = generator_getbase(ckp);
 	if (unlikely(!wb)) {
 		if (retries++ < 5 || *prio == GEN_PRIORITY) {
 			LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
+			/* Sleep for 1 second before retrying to avoid hammering the node */
+			sleep(1);
 			goto retry;
 		}
 		LOGWARNING("Generator failed in update_base after retrying");
@@ -1627,6 +1724,97 @@ retry:
 
 	wb->ckp = ckp;
 
+	/* Set algorithm from ckpool config */
+	wb->scrypt_algo = ckp->scrypt_algo;
+
+	/* Check if this template is actually different from the last one.
+	 * Update if prevhash, coinb1, or merkle branches changed. */
+	bool should_update = false;
+
+	/* First check prevhash */
+	if (strcmp(wb->prevhash, last_prevhash) != 0) {
+		should_update = true;
+		LOGNOTICE("Previous block hash changed from ...%s to ...%s",
+			last_prevhash + 56, wb->prevhash + 56);
+		strcpy(last_prevhash, wb->prevhash);
+	}
+
+	/* Check if coinb1 changed (includes timestamp and other varying data) */
+	if (wb->coinb1) {
+		if (strcmp(wb->coinb1, last_coinb1) != 0) {
+			should_update = true;
+			LOGNOTICE("Coinbase part 1 changed, sending update");
+			strncpy(last_coinb1, wb->coinb1, sizeof(last_coinb1) - 1);
+			last_coinb1[sizeof(last_coinb1) - 1] = '\0';
+		}
+	} else {
+		LOGWARNING("wb->coinb1 is NULL!");
+	}
+
+	/* Check merkle branch count from template */
+	json_t *merklebranch = json_object_get(wb->json, "merklebranch");
+	int current_merkle_count = 0;
+	if (merklebranch && json_is_array(merklebranch)) {
+		current_merkle_count = json_array_size(merklebranch);
+	}
+
+	if (current_merkle_count != last_merkle_count) {
+		should_update = true;
+		LOGNOTICE("Merkle branch count changed from %d to %d",
+			last_merkle_count, current_merkle_count);
+		last_merkle_count = current_merkle_count;
+	}
+
+	/* If nothing meaningful changed, skip this update */
+	if (!should_update) {
+		/* Don't log to avoid spamming - this happens frequently */
+		clear_workbase(ckp, wb);
+		ret = true;  /* Not a failure, just no update needed */
+		goto out;
+	}
+
+	/* Parse the share submission target from GBT (Quai provides this) */
+	if (wb->json && ckp->btcsolo) {
+		const char *target_str = json_string_value(json_object_get(wb->json, "target"));
+		if (target_str) {
+			/* Store target string and calculate difficulty for easy comparison */
+			strncpy(wb->target, target_str, 65);
+
+			/* Convert target hex to binary, then to difficulty */
+			uchar target_bin[32];
+			hex2bin(target_bin, target_str, 32);
+
+			/* Debug: show the first few bytes to verify parsing */
+			char *first_bytes = bin2hex(target_bin, 8);
+			LOGDEBUG("Target first 8 bytes (BE): %s", first_bytes);
+			free(first_bytes);
+
+			/* For share_diff (stratum protocol), always use Bitcoin difficulty scale.
+			 * Both SHA256 and Scrypt pools use the same difficulty scale for stratum. */
+			wb->share_diff = diff_from_betarget(target_bin);
+
+			/* Also try converting from nbits for comparison */
+			const char *nbits_str = json_string_value(json_object_get(wb->json, "bits"));
+			if (nbits_str) {
+				char nbits[4];
+				hex2bin(nbits, nbits_str, 4);
+				double nbits_diff;
+				if (wb->scrypt_algo)
+					nbits_diff = diff_from_nbits_scrypt(nbits);
+				else
+					nbits_diff = diff_from_nbits(nbits);
+				LOGNOTICE("GBT: target=%s (diff %.6f), nbits=%s (diff %.6f)",
+					target_str, wb->share_diff, nbits_str, nbits_diff);
+			} else {
+				LOGNOTICE("GBT provided share submission target: %s (diff %.6f)", target_str, wb->share_diff);
+			}
+		} else {
+			/* No target provided, will fall back to client diff */
+			wb->share_diff = 0;
+			LOGWARNING("No target provided in GBT, will use client difficulty for share submission");
+		}
+	}
+
 	/* We want header+coinbase only. Don't build Merkle from transactions. */
 	txns = NULL;  /* Initialize to NULL - we don't build transactions for Quai */
 	wb->txns = 0;
@@ -1635,6 +1823,8 @@ retry:
 	wb->merkles = 0;
 	wb->merkle_array = json_array();
 
+	/* IMPORTANT: Parse merkle branches BEFORE generate_coinbase, as the new
+	   coinb1/coinb2 fast-path returns early and needs these already set up */
 	/* Consume merklebranch from the template (Quai) and build wb->merklebin[].
 	   IMPORTANT: CKPool's hashing expects the sibling bytes LE (little-endian),
 	   and concatenation order is (running_root || sibling).
@@ -1650,7 +1840,8 @@ retry:
 				if (!s) continue;
 				if (s[0] == '0' && s[1] == 'x') s += 2;  /* strip 0x if present */
 
-				/* Convert BE string → BE bytes → LE bytes */
+
+				/* Convert BE string → BE bytes → LE bytes for hashing */
 				uchar be[32];
 				hex2bin((char *)be, s, 32);
 				bswap_256(&wb->merklebin[wb->merkles][0], (char *)be);
@@ -1661,22 +1852,43 @@ retry:
 
 				wb->merkles++;
 			}
+			LOGNOTICE("Parsed %d merkle branches from merklebranch array", wb->merkles);
+		} else {
+			LOGNOTICE("No merklebranch array found in template");
 		}
 	}
+
+
 
 	/* No segwit witness commitment when we're not carrying full tx set */
 	wb->insert_witness = false;
 
 	generate_coinbase(ckp, wb);
 
+	/* Check if merkle branches changed BEFORE updating current_workbase */
+	bool merkle_changed = false;
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase) {
+		if (wb->merkles != sdata->current_workbase->merkles) {
+			merkle_changed = true;
+			LOGNOTICE("Merkle branch count changed from %d to %d - requiring clean job",
+				sdata->current_workbase->merkles, wb->merkles);
+		}
+	}
+	ck_runlock(&sdata->workbase_lock);
+
 	add_base(ckp, sdata, wb, &new_block);
 
 	if (new_block)
 		LOGNOTICE("Block hash changed to %s", sdata->lastswaphash);
+
+	/* Send clean job if new block OR merkle branches changed */
+	bool clean = new_block || merkle_changed;
+
 	if (ckp->btcsolo)
-		stratum_broadcast_updates(sdata, new_block);
+		stratum_broadcast_updates(sdata, clean);
 	else
-		stratum_broadcast_update(sdata, wb, new_block);
+		stratum_broadcast_update(sdata, wb, clean);
 	ret = true;
 	LOGINFO("Broadcast updated stratum base");
 	/* Update transactions after stratum broadcast to not delay
@@ -1976,12 +2188,15 @@ static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 
 static void add_node_base(ckpool_t *ckp, json_t *val, bool trusted, int64_t client_id)
 {
-	workbase_t *wb = ckzalloc(sizeof(workbase_t));
-	sdata_t *sdata = ckp->sdata;
-	bool new_block = false;
-	char header[272];
+    workbase_t *wb = ckzalloc(sizeof(workbase_t));
+    sdata_t *sdata = ckp->sdata;
+    bool new_block = false;
+    char header[272];
 
-	wb->ckp = ckp;
+    wb->ckp = ckp;
+    /* Carry the algorithm setting from this pool instance so downstream
+     * hashing and submission match the chain (SHA256d vs Scrypt). */
+    wb->scrypt_algo = ckp->scrypt_algo;
 	/* This is the client id if this workbase came from a remote trusted
 	 * server. */
 	wb->client_id = client_id;
@@ -2105,11 +2320,23 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
 	data32 = (uint32_t *)data;
 	swap32 = (uint32_t *)swap;
 	flip_80(swap32, data32);
-	sha256(swap, 80, hash1);
-	sha256(hash1, 32, hash);
 
-	/* Calculate the diff of the share here */
-	return diff_from_target(hash);
+	/* Use Scrypt or SHA256d depending on algorithm */
+	if (wb->scrypt_algo) {
+		if (!scrypt_1024_1_1_256((const uint8_t*)swap, 80, hash)) {
+			LOGERR("Scrypt hashing failed in share_diff");
+			return 0.0;
+		}
+	} else {
+		/* Original SHA256d for Bitcoin */
+		sha256(swap, 80, hash1);
+		sha256(hash1, 32, hash);
+	}
+
+    /* Calculate the diff of the share here.
+     * For share validation, always use Bitcoin scale regardless of algorithm.
+     * This matches the stratum protocol difficulty scale. */
+    return diff_from_target(hash);
 }
 
 static void add_remote_blockdata(ckpool_t *ckp, json_t *val, const int cblen, const char *coinbase,
@@ -2278,6 +2505,26 @@ static workbase_t *get_workbase(sdata_t *sdata, const int64_t id)
 	return wb;
 }
 
+/* Find workbase by matching lower 32 bits of ID (for 8-character job IDs) */
+static workbase_t *get_workbase_by_jobid(sdata_t *sdata, const int64_t job_id_32bit)
+{
+	workbase_t *wb, *tmp, *match = NULL;
+	uint32_t search_lower = (uint32_t)(job_id_32bit & 0xFFFFFFFF);
+
+	ck_wlock(&sdata->workbase_lock);
+	HASH_ITER(hh, sdata->workbases, wb, tmp) {
+		uint32_t wb_lower = (uint32_t)(wb->id & 0xFFFFFFFF);
+		if (wb_lower == search_lower) {
+			match = wb;
+			match->readcount++;
+			break;
+		}
+	}
+	ck_wunlock(&sdata->workbase_lock);
+
+	return match;
+}
+
 static workbase_t *__find_remote_workbase(sdata_t *sdata, const int64_t id, const int64_t client_id)
 {
 	int64_t lookup[2] = {id, client_id};
@@ -2382,8 +2629,17 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 		coinbase = alloca(cblen);
 		hex2bin(coinbase, coinbasehex, cblen);
 		hex2bin(swap, swaphex, 80);
-		sha256(swap, 80, hash1);
-		sha256(hash1, 32, hash);
+
+		/* Use Scrypt or SHA256d depending on algorithm */
+		if (wb->scrypt_algo) {
+			if (!scrypt_1024_1_1_256((const uint8_t*)swap, 80, hash)) {
+				LOGERR("Scrypt hashing failed");
+				return;
+			}
+		} else {
+			sha256(swap, 80, hash1);
+			sha256(hash1, 32, hash);
+		}
 	} else {
 		/* Rebuild the old way if we can if the upstream pool is using
 		 * the old format only */
@@ -2393,6 +2649,13 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 		coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
 		/* Fill in the hashes */
 		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
+	}
+
+	/* Validate merkle root before submitting to the node */
+	if (unlikely(!validate_merkle_root(wb, coinbase, cblen, swap))) {
+		LOGWARNING("Rejecting candidate block (job %"PRId64") due to merkle-root mismatch prior to submit",
+		           wb->id);
+		goto out;
 	}
 
 	/* Now we have enough to assemble a block */
@@ -3180,9 +3443,11 @@ static void update_notify(ckpool_t *ckp, const char *cmd)
 	}
 	LOGINFO("Got updated notify for proxy %d:%d", id, subid);
 
-	wb = ckzalloc(sizeof(workbase_t));
-	wb->ckp = ckp;
-	wb->proxy = true;
+    wb = ckzalloc(sizeof(workbase_t));
+    wb->ckp = ckp;
+    wb->proxy = true;
+    /* Ensure proxied work uses the same algorithm as this instance */
+    wb->scrypt_algo = ckp->scrypt_algo;
 
 	json_get_int64(&wb->id, val, "jobid");
 	json_strcpy(wb->prevhash, val, "prevhash");
@@ -3566,9 +3831,26 @@ static stratum_instance_t *__stratum_add_instance(ckpool_t *ckp, int64_t id, con
 	if (server >= ckp->serverurls)
 		server = 0;
 	client->server = server;
-	client->diff = client->old_diff = ckp->startdiff;
-	LOGNOTICE("Client %ld: Set initial diff to %ld from ckp->startdiff=%ld",
-		  id, client->diff, ckp->startdiff);
+
+	/* For btcsolo mode with share_diff from GBT, use that instead of startdiff */
+	if (ckp->btcsolo && sdata->current_workbase && sdata->current_workbase->share_diff > 0) {
+		/* Ensure minimum difficulty of 1 for miners */
+		double share_diff = sdata->current_workbase->share_diff;
+		client->diff = client->old_diff = share_diff < 1.0 ? 1 : share_diff;
+		strncpy(client->target, sdata->current_workbase->target, 68);
+		strncpy(client->old_target, sdata->current_workbase->target, 68);
+		LOGNOTICE("Client %ld: Set initial diff to %ld from GBT target (share_diff %.6f)",
+			  id, client->diff, share_diff);
+	} else {
+		client->diff = client->old_diff = ckp->startdiff;
+		if (sdata->current_workbase && sdata->current_workbase->target[0]) {
+			strncpy(client->target, sdata->current_workbase->target, 68);
+			strncpy(client->old_target, sdata->current_workbase->target, 68);
+		}
+		LOGNOTICE("Client %ld: Set initial diff to %ld from ckp->startdiff=%ld",
+			  id, client->diff, ckp->startdiff);
+	}
+
 	if (ckp->server_highdiff && ckp->server_highdiff[server]) {
 		client->suggest_diff = ckp->highdiff;
 		if (client->suggest_diff > client->diff)
@@ -4877,6 +5159,8 @@ static void *blockupdate(void *arg)
 			case GETBEST_SUCCESS:
 				if (strcmp(hash, sdata->lastswaphash)) {
 					update_base(sdata, GEN_PRIORITY);
+					/* Sleep to avoid hammering update_base in tight loop */
+					cksleep_ms(ckp->blockpoll);
 					break;
 				}
 				__attribute__((fallthrough));
@@ -5752,10 +6036,29 @@ out:
 static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
 {
 	json_t *json_msg;
+	ckpool_t *ckp = client->ckp;
+	int64_t stratum_diff = client->diff;
 
-	LOGNOTICE("Sending difficulty %ld to client %ld", client->diff, client->id);
-	JSON_CPACK(json_msg, "{s[I]soss}", "params", client->diff, "id", json_null(),
+	/* For Scrypt, scale difficulty by 65536 to match the miner's interpretation.
+	 * Different Scrypt miners may use different scales; 65536 = 2^16. */
+	if (ckp->scrypt_algo) {
+		stratum_diff = client->diff * 65536;
+		LOGNOTICE("Sending difficulty %ld (scaled from %ld by 65536) to Scrypt client %ld",
+			  stratum_diff, client->diff, client->id);
+	} else {
+		LOGNOTICE("Sending difficulty %ld to client %ld", client->diff, client->id);
+	}
+
+	JSON_CPACK(json_msg, "{s[I]soss}", "params", stratum_diff, "id", json_null(),
 			     "method", "mining.set_difficulty");
+
+	/* Log the actual mining.set_difficulty message being sent */
+	char *diff_str = json_dumps(json_msg, JSON_COMPACT);
+	if (diff_str) {
+		LOGNOTICE("MINING.SET_DIFFICULTY sent to client %ld: %s", client->id, diff_str);
+		free(diff_str);
+	}
+
 	stratum_add_send(sdata, json_msg, client->id, SM_DIFF);
 }
 
@@ -5912,7 +6215,9 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	copy_tv(&client->ldc, &now_t);
 	client->diff_change_job_id = next_blockid;
 	client->old_diff = client->diff;
+	strncpy(client->old_target, client->target, 68);
 	client->diff = optimal;
+	/* Target will be updated when next workbase is sent */
 	stratum_send_diff(sdata, client);
 }
 
@@ -5932,7 +6237,7 @@ downstream_block(ckpool_t *ckp, sdata_t *sdata, const json_t *val, const int cbl
 /* We should already be holding a wb readcount. Needs to be entered with
  * client holding a ref count. */
 static void
-test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uchar *data,
+test_blocksolve(const stratum_instance_t *client, workbase_t *wb, const uchar *data,
 		const uchar *hash, const double diff, const char *coinbase, int cblen,
 		const char *nonce2, const char *nonce, const uint32_t ntime32, const uint32_t version_mask,
 		const bool stale)
@@ -5940,18 +6245,33 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	char blockhash[68], cdfield[64], *gbt_block;
 	sdata_t *sdata = client->sdata;
 	ckpool_t *ckp = wb->ckp;
+	uchar target[32], target_swap[32];
 	double network_diff;
 	json_t *val = NULL;
 	uchar flip32[32];
+	bool meets_target;
 	ts_t ts_now;
 	bool ret;
 
-	/* For Quai (btcsolo), submit any share that meets share difficulty
+	/* For Quai (btcsolo), validate share against target (not difficulty)
 	 * For standard pools, submit anything over 99.9% of network diff */
 	if (ckp->btcsolo) {
-		/* Quai: submit if share meets the client's difficulty */
-		if (likely(diff < client->diff * 0.999))
+		/* Use the target from the workbase to validate the hash */
+		if (!wb->target[0]) {
+			LOGWARNING("No target available in workbase for block solve validation");
 			return;
+		}
+
+		/* Convert target from hex and byte-swap to match hash byte order */
+		hex2bin(target, wb->target, 32);
+		swap_256(target_swap, target);
+		meets_target = fulltest(hash, target_swap);
+
+		if (!meets_target) {
+			LOGDEBUG("Share diff %.6f does not meet target, not submitting", diff);
+			return;
+		}
+		LOGNOTICE("Share diff %.6f meets target %s, submitting to node", diff, wb->target);
 	} else {
 		network_diff = sdata->current_workbase->network_diff * 0.999;
 		if (likely(diff < network_diff))
@@ -5959,6 +6279,16 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	}
 
 	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
+
+	/* Check if we've already submitted a block for this job ID */
+	if (wb->block_submitted) {
+		LOGNOTICE("Block already submitted for job %"PRId64", skipping duplicate submission", wb->id);
+		return;
+	}
+
+	/* Mark this job as having a block submitted */
+	wb->block_submitted = true;
+
 	/* Can't submit a block in proxy mode without the transactions */
 	if (!ckp->node && wb->proxy)
 		return;
@@ -5966,7 +6296,41 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	ts_realtime(&ts_now);
 	sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
 
+	/* Validate merkle root before submitting to the node */
+	if (unlikely(!validate_merkle_root(wb, coinbase, cblen, data))) {
+		LOGWARNING("WARNING: Merkle root mismatch for candidate block (job %"PRId64"), submitting anyway",
+				wb->id);
+	}
+
+	/* Check if this block is still valid against the current template.
+	 * Verify prevhash and merkle branches match current work. */
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase && wb != sdata->current_workbase) {
+		/* Check if prevhash has changed */
+		if (strcmp(wb->prevhash, sdata->current_workbase->prevhash) != 0) {
+			LOGWARNING("WARNING: Prevhash changed from %s to %s, submitting block anyway",
+				wb->prevhash, sdata->current_workbase->prevhash);
+		}
+
+		/* Check if merkle branch count has changed */
+		if (wb->merkles != sdata->current_workbase->merkles) {
+			LOGWARNING("WARNING: Merkle branch count changed from %d to %d (job %"PRId64" vs current %"PRId64"), submitting anyway",
+				wb->merkles, sdata->current_workbase->merkles, wb->id, sdata->current_workbase->id);
+		}
+
+		/* If we're using the new coinb1/coinb2 format, check if they've changed */
+		if (wb->coinb_parts_supplied && sdata->current_workbase->coinb_parts_supplied) {
+			if (strcmp(wb->coinb1, sdata->current_workbase->coinb1) != 0 ||
+			    strcmp(wb->coinb2, sdata->current_workbase->coinb2) != 0) {
+				LOGWARNING("WARNING: Coinbase template changed, submitting block anyway");
+			}
+		}
+	}
+	ck_runlock(&sdata->workbase_lock);
 	gbt_block = process_block(wb, coinbase, cblen, data, hash, flip32, blockhash);
+	char *gbt_block_hex = bin2hex(gbt_block, strlen(gbt_block));
+	LOGNOTICE("Gbt block: %s", gbt_block_hex);
+	free(gbt_block_hex);
 	send_node_block(ckp, sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
 			wb->id, diff, client->id, coinbase, cblen, data);
 
@@ -6061,6 +6425,19 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	LOGNOTICE("Building coinbase: coinb1len=%d enonce1=%d enonce2=%d coinb2len=%d total=%d",
 		wb->coinb1len, wb->enonce1constlen + wb->enonce1varlen, wb->enonce2varlen,
 		cb2len, cblen + cb2len);
+
+	/* Guard: if using new Quai format with OP_PUSH42, verify coinb2 starts with 30 zeros + signature time */
+	if (wb->coinb1len > 0 && wb->coinb1bin[wb->coinb1len - 1] == 0x2a) { /* OP_PUSH42 */
+		static const unsigned char zeros30[30] = {0};
+		if (cb2len < 30 || memcmp(coinb2bin, zeros30, 30) != 0) {
+			LOGWARNING("coinb2 does not start with 30 zero extraData bytes; "
+				   "will produce a different coinbase hash than the node. Aborting.");
+			ck_runlock(&sdata->instance_lock);
+			return 0.0; /* reject share / do not submit block */
+		}
+		/* Note: After the 30 zeros, there should be 0x04 (OP_PUSH4) followed by 4 bytes of signature_time */
+	}
+
 	memcpy(coinbase + cblen, coinb2bin, cb2len);
 	ck_runlock(&sdata->instance_lock);
 
@@ -6123,18 +6500,30 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	flip_80(swap32, data32);
 
 	char *header_hex = bin2hex(swap, 80);
-	LOGNOTICE("Block header AFTER flip_80 (for SHA256 hashing): %s", header_hex);
+	LOGNOTICE("Block header AFTER flip_80 (for %s hashing): %s",
+		wb->scrypt_algo ? "Scrypt" : "SHA256", header_hex);
 	free(header_hex);
 
-	sha256(swap, 80, hash1);
-	sha256(hash1, 32, hash);
+	/* Use Scrypt or SHA256d depending on algorithm */
+	if (wb->scrypt_algo) {
+		if (!scrypt_1024_1_1_256((const uint8_t*)swap, 80, hash)) {
+			LOGERR("Scrypt hashing failed in parse_submit");
+			return 0.0;
+		}
+	} else {
+		/* Original SHA256d for Bitcoin */
+		sha256(swap, 80, hash1);
+		sha256(hash1, 32, hash);
+	}
 
 	char *hash_hex = bin2hex(hash, 32);
 	LOGNOTICE("Share hash (LE): %s", hash_hex);
 	free(hash_hex);
 
-	/* Calculate the diff of the share here */
-	ret = diff_from_target(hash);
+    /* Calculate the diff of the share here.
+     * For share validation, always use Bitcoin scale regardless of algorithm.
+     * This matches the stratum protocol difficulty scale. */
+    ret = diff_from_target(hash);
 	LOGNOTICE("PoW verified: share difficulty = %.6f", ret);
 
 	/* Test we haven't solved a block regardless of share status */
@@ -6313,20 +6702,81 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 	sscanf(job_id, "%lx", &id);
 	sscanf(ntime, "%x", &ntime32);
 
+	/* Log share submission details */
+	LOGNOTICE("SHARE SUBMISSION from %s:", workername);
+	LOGNOTICE("  Job ID (string): '%s' -> parsed as %"PRId64" (0x%lx)", job_id, id, id);
+	LOGNOTICE("  Nonce2: %s, Ntime: %s (0x%x), Nonce: %s", nonce2, ntime, ntime32, nonce);
+
 	share = true;
 
 	if (unlikely(!sdata->current_workbase))
 		return json_boolean(false);
 
-	wb = get_workbase(sdata, id);
-	if (unlikely(!wb)) {
-		id = sdata->current_workbase->id;
-		err = SE_INVALID_JOBID;
-		json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
-		strncpy(idstring, job_id, 19);
-		ASPRINTF(&fname, "%s.sharelog", sdata->current_workbase->logdir);
-		goto out_nowb;
-	}
+    /* Try lookup by lower 32 bits first (for 8-character job IDs) */
+    wb = get_workbase_by_jobid(sdata, id);
+    if (unlikely(!wb)) {
+        /* Fallback: try exact match with full 64-bit ID */
+        wb = get_workbase(sdata, id);
+    }
+    if (unlikely(!wb)) {
+        /* Workaround for buggy miners that truncate job ID to 15 chars */
+        size_t job_id_len = strlen(job_id);
+        bool is_hex = true;
+
+        /* Check if it's all hex chars (validhex rejects odd lengths) */
+        for (size_t i = 0; i < job_id_len && is_hex; i++) {
+            if (!((job_id[i] >= '0' && job_id[i] <= '9') ||
+                  (job_id[i] >= 'a' && job_id[i] <= 'f') ||
+                  (job_id[i] >= 'A' && job_id[i] <= 'F'))) {
+                is_hex = false;
+            }
+        }
+
+        LOGDEBUG("  Job ID lookup failed. Length=%zu, is_hex=%d", job_id_len, is_hex);
+
+        if (job_id_len == 15 && is_hex) {
+            char fixed_job_id[17];
+            int64_t fixed_id;
+
+            /* Try appending a '0' to make it 16 chars */
+            sprintf(fixed_job_id, "%s0", job_id);
+            sscanf(fixed_job_id, "%lx", &fixed_id);
+
+            LOGNOTICE("  Trying workaround: '%s' -> '%s' (id=%"PRId64")",
+                      job_id, fixed_job_id, fixed_id);
+
+            wb = get_workbase(sdata, fixed_id);
+            if (wb) {
+                if (wb == sdata->current_workbase) {
+                    /* Accept this workaround only if it matches current workbase */
+                    LOGNOTICE("  WORKAROUND SUCCESS: Fixed truncated job ID (matches current workbase)");
+                    id = fixed_id;
+                    /* Continue processing with the fixed job ID */
+                } else {
+                    LOGNOTICE("  WORKAROUND REJECTED: Fixed job ID found but not current (wb id=%"PRId64" != current=%"PRId64")",
+                              wb->id, sdata->current_workbase->id);
+                    wb = NULL;  /* Reset to trigger rejection */
+                }
+            } else {
+                LOGNOTICE("  WORKAROUND FAILED: Fixed job ID %"PRId64" not found in workbase table", fixed_id);
+            }
+        } else {
+            LOGDEBUG("  Not attempting workaround (len=%zu, hex=%d)", job_id_len, is_hex);
+        }
+
+        if (!wb) {
+            id = sdata->current_workbase->id;
+            err = SE_INVALID_JOBID;
+            json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
+            strncpy(idstring, job_id, 19);
+            LOGWARNING("  REJECTED: Job ID %"PRId64" not found! Current workbase: %"PRId64" (%s)",
+                       id, sdata->current_workbase->id, sdata->current_workbase->idstring);
+            ASPRINTF(&fname, "%s.sharelog", sdata->current_workbase->logdir);
+            /* If the job id is unknown, it's almost certainly stale: push a fresh clean notify */
+            stratum_send_update(sdata, client->id, true);
+            goto out_nowb;
+        }
+    }
 	wdiff = wb->diff;
 	strncpy(idstring, wb->idstring, 20);
 	ASPRINTF(&fname, "%s.sharelog", wb->logdir);
@@ -6383,9 +6833,12 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 				goto no_stale;
 			}
 		}
-		err = SE_STALE;
-		json_set_string(json_msg, "reject-reason", SHARE_ERR(err));
-		goto out_submit;
+		/* Log the stale share but don't reject it to the miner */
+		LOGINFO("Client %s submitted stale share diff %.1f (will still process): %s",
+			client->identity, sdiff, hexhash);
+        /* Proactively push a fresh clean notify to this client to nudge it off stale work */
+        stratum_send_update(sdata, client->id, true);
+		/* Continue processing as if it's not stale - don't set err or goto out_submit */
 	}
 no_stale:
 	/* Ntime cannot be less, but allow forward ntime rolling up to max */
@@ -6412,9 +6865,38 @@ out_nowb:
 		diff = client->old_diff;
 	if (!invalid) {
 		char wdiffsuffix[16];
+		uchar target[32], target_swap[32];
+		bool meets_target;
+		const char *target_to_use;
 
 		suffix_string(wdiff, wdiffsuffix, 16, 0);
-		if (sdiff >= diff) {
+
+		/* Use old target for shares from before the diff change */
+		if (id < client->diff_change_job_id && client->old_target[0]) {
+			target_to_use = client->old_target;
+		} else if (client->target[0]) {
+			target_to_use = client->target;
+		} else if (wb && wb->target[0]) {
+			/* Fallback to workbase target if client target not set */
+			target_to_use = wb->target;
+		} else {
+			target_to_use = NULL;
+		}
+
+		/* Use the share target to validate the hash.
+		 * This is more accurate than comparing difficulty values. */
+		if (target_to_use) {
+			hex2bin(target, target_to_use, 32);
+			/* Target hex string is big-endian, but hash is little-endian.
+			 * Byte-swap target to match hash byte order for fulltest() */
+			swap_256(target_swap, target);
+			meets_target = fulltest(hash, target_swap);
+		} else {
+			/* Fallback to difficulty comparison if target is not available */
+			meets_target = (sdiff >= diff);
+		}
+
+		if (meets_target) {
 			if (new_share(sdata, hash, id)) {
 				LOGINFO("Accepted client %s share diff %.1f/%.0f/%s: %s",
 					client->identity, sdiff, diff, wdiffsuffix, hexhash);
@@ -6560,18 +7042,44 @@ static json_t *__stratum_notify(const workbase_t *wb, const bool clean)
 			clean,
 			"id", json_null(),
 			"method", "mining.notify");
+
+	/* Log the mining.notify message for debugging */
+	char *notify_str = json_dumps(val, JSON_COMPACT);
+	if (notify_str) {
+		LOGNOTICE("MINING.NOTIFY: %s", notify_str);
+		LOGNOTICE("  Job ID: %s (workbase id: %"PRId64")", wb->idstring, wb->id);
+		LOGNOTICE("  Clean: %s, Height: %d", clean ? "true" : "false", wb->height);
+		free(notify_str);
+	}
+
 	return val;
 }
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, const bool clean)
 {
-	json_t *json_msg;
+    int repeats = clean ? 5 : 1;
 
-	ck_rlock(&sdata->workbase_lock);
-	json_msg = __stratum_notify(wb, clean);
-	ck_runlock(&sdata->workbase_lock);
+    LOGNOTICE("Broadcasting stratum update with clean=%s for workbase id %"PRId64,
+        clean ? "true" : "false", wb->id);
 
-	stratum_broadcast(sdata, json_msg, SM_UPDATE);
+    for (int i = 0; i < repeats; i++) {
+        json_t *json_msg;
+
+        ck_rlock(&sdata->workbase_lock);
+        json_msg = __stratum_notify(wb, clean);
+        ck_runlock(&sdata->workbase_lock);
+
+        /* Log the actual JSON being sent to debug clean flag - only first repeat to reduce spam */
+        if (clean && i == 0) {
+            char *json_str = json_dumps(json_msg, JSON_COMPACT);
+            if (json_str) {
+                LOGWARNING("CLEAN JOB NOTIFICATION being sent (x5)");
+                free(json_str);
+            }
+        }
+
+        stratum_broadcast(sdata, json_msg, SM_UPDATE);
+    }
 }
 
 /* For sending a single stratum template update */
@@ -6621,6 +7129,16 @@ static json_t *__user_notify(const workbase_t *wb, const user_instance_t *user, 
 			clean,
 			"id", json_null(),
 			"method", "mining.notify");
+
+	/* Log the mining.notify message for debugging (btcsolo mode) */
+	char *notify_str = json_dumps(val, JSON_COMPACT);
+	if (notify_str) {
+		LOGNOTICE("MINING.NOTIFY (btcsolo): %s", notify_str);
+		LOGNOTICE("  Job ID: %s (workbase id: %"PRId64", user: %s)", wb->idstring, wb->id, user->username);
+		LOGNOTICE("  Clean: %s, Height: %d", clean ? "true" : "false", wb->height);
+		free(notify_str);
+	}
+
 	return val;
 }
 
@@ -6628,27 +7146,62 @@ static json_t *__user_notify(const workbase_t *wb, const user_instance_t *user, 
  * recursive locking. */
 static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 {
-	stratum_instance_t *client, *tmp;
-	json_t *json_msg;
+    stratum_instance_t *client, *tmp;
+    double new_share_diff = 0;
+    ckpool_t *ckp = sdata->ckp;
 
-	ck_wlock(&sdata->instance_lock);
-	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
-		if (!client->user_instance)
-			continue;
-		__inc_instance_ref(client);
-		ck_wunlock(&sdata->instance_lock);
+    LOGNOTICE("Broadcasting stratum updates to all clients with clean=%s",
+        clean ? "true" : "false");
 
-		ck_rlock(&sdata->workbase_lock);
-		json_msg = __user_notify(sdata->current_workbase, client->user_instance, clean);
-		ck_runlock(&sdata->workbase_lock);
-
-		if (likely(json_msg))
-			stratum_add_send(sdata, json_msg, client->id, SM_UPDATE);
-
-		ck_wlock(&sdata->instance_lock);
-		__dec_instance_ref(client);
+	/* For btcsolo mode, check if share_diff has changed */
+	if (ckp->btcsolo && sdata->current_workbase) {
+		new_share_diff = sdata->current_workbase->share_diff;
 	}
-	ck_wunlock(&sdata->instance_lock);
+
+    ck_wlock(&sdata->instance_lock);
+    HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
+        if (!client->user_instance)
+            continue;
+        __inc_instance_ref(client);
+        ck_wunlock(&sdata->instance_lock);
+
+        /* Update client difficulty if share_diff changed in btcsolo mode */
+        if (ckp->btcsolo && new_share_diff > 0 && client->diff != new_share_diff) {
+            client->old_diff = client->diff;
+            strncpy(client->old_target, client->target, 68);
+            /* Ensure minimum difficulty of 1 for miners */
+            client->diff = new_share_diff < 1.0 ? 1 : new_share_diff;
+            if (sdata->current_workbase && sdata->current_workbase->target[0]) {
+                strncpy(client->target, sdata->current_workbase->target, 68);
+            }
+            LOGNOTICE("Updating client %ld diff from %ld to %ld based on new GBT target (share_diff %.6f)",
+                client->id, client->old_diff, client->diff, new_share_diff);
+            stratum_send_diff(sdata, client);
+        }
+
+        /* Update client target from current workbase if it changed (but diff didn't) */
+        if (sdata->current_workbase && sdata->current_workbase->target[0]) {
+            if (strcmp(client->target, sdata->current_workbase->target) != 0) {
+                strncpy(client->target, sdata->current_workbase->target, 68);
+                LOGDEBUG("Updated client %ld target from workbase", client->id);
+            }
+        }
+
+        /* Repeat clean notifications to improve reliability */
+        int repeats = clean ? 5 : 1;
+        for (int i = 0; i < repeats; i++) {
+            json_t *json_msg;
+            ck_rlock(&sdata->workbase_lock);
+            json_msg = __user_notify(sdata->current_workbase, client->user_instance, clean);
+            ck_runlock(&sdata->workbase_lock);
+            if (likely(json_msg))
+                stratum_add_send(sdata, json_msg, client->id, SM_UPDATE);
+        }
+
+        ck_wlock(&sdata->instance_lock);
+        __dec_instance_ref(client);
+    }
+    ck_wunlock(&sdata->instance_lock);
 }
 
 static void send_json_err(sdata_t *sdata, const int64_t client_id, json_t *id_val, const char *err_msg)
@@ -6705,6 +7258,17 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 		LOGINFO("Failed to parse suggest_difficulty for client %s", client->identity);
 		return;
 	}
+
+	/* For Scrypt, miners send difficulty in their own scale (65536x Bitcoin scale).
+	 * Convert to internal Bitcoin scale for consistent storage. */
+	if (ckp->scrypt_algo) {
+		LOGNOTICE("Client %s suggested Scrypt difficulty %ld, converting to internal scale %ld",
+			  client->identity, sdiff, sdiff / 65536);
+		sdiff = sdiff / 65536;
+		if (sdiff < 1)
+			sdiff = 1;
+	}
+
 	/* Clamp suggest diff to global pool mindiff */
 	if (sdiff < ckp->mindiff)
 		sdiff = ckp->mindiff;
@@ -6715,7 +7279,9 @@ static void suggest_diff(ckpool_t *ckp, stratum_instance_t *client, const char *
 		return;
 	client->diff_change_job_id = client->sdata->workbase_id + 1;
 	client->old_diff = client->diff;
+	strncpy(client->old_target, client->target, 68);
 	client->diff = sdiff;
+	/* Target will be updated when next workbase is sent */
 	stratum_send_diff(ckp->sdata, client);
 }
 
@@ -7369,8 +7935,18 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		LOGWARNING("Possible remote block solve diff %lf !", diff);
 		hex2bin(coinbase, coinbasehex, cblen);
 		hex2bin(swap, swaphex, 80);
-		sha256(swap, 80, hash1);
-		sha256(hash1, 32, hash);
+
+		/* Use Scrypt or SHA256d depending on algorithm */
+		if (wb->scrypt_algo) {
+			if (!scrypt_1024_1_1_256((const uint8_t*)swap, 80, hash)) {
+				LOGERR("Scrypt hashing failed in parse_remote_block");
+				put_remote_workbase(sdata, wb);
+				return;
+			}
+		} else {
+			sha256(swap, 80, hash1);
+			sha256(hash1, 32, hash);
+		}
 		gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
 		/* Note nodes use jobid of the mapped_id instead of workinfoid */
 		json_set_int64(val, "jobid", wb->mapped_id);
@@ -8408,7 +8984,10 @@ static void *statsupdate(void *arg)
 		dealloc(s);
 
 		/* Round to 4 significant digits */
-		percent = round(stats->accounted_diff_shares * 10000 / stats->network_diff) / 100;
+		if (stats->network_diff > 0)
+			percent = round(stats->accounted_diff_shares * 10000 / stats->network_diff) / 100;
+		else
+			percent = 0;
 		JSON_CPACK(val, "{sf,sI,sI,sI,sf,sf,sf,sf}",
 			        "diff", percent,
 				"accepted", stats->accounted_diff_shares,
@@ -8864,4 +9443,68 @@ out:
 	LOGEMERG("Stratifier failure, shutting down");
 	exit(1);
 	return NULL;
+}
+
+/* Validate that the header's merkle root matches the merkle computed from
+ * the coinbase and the workbase's merkle branches.
+ *
+ * Inputs:
+ *   wb       : workbase_t with wb->merkles and wb->merklebin[i][32] (LE bytes)
+ *   coinbase : raw coinbase bytes (not hex)
+ *   cblen    : length of coinbase in bytes
+ *   header80 : 80-byte block header that will be hashed (i.e. AFTER flip_80)
+ *              The merkle root field lives at offset 36..67.
+ *
+ * Returns:
+ *   true if header's merkle matches recomputed merkle, else false.
+ */
+ static bool validate_merkle_root(const workbase_t *wb,
+	const char *coinbase, int cblen,
+	const uchar *header80)
+{
+	uchar running[32], buf[64];
+	uchar header_mr[32], running_le[32];
+	int i;
+
+	/* running = dSHA256(coinbase) */
+	gen_hash((const uchar *)coinbase, running, cblen);
+
+	/* Apply branches in CKPool's order: running || sibling (sibling is LE) */
+	for (i = 0; i < wb->merkles; i++) {
+		memcpy(buf,       running,                 32);              /* running (as-is) */
+		memcpy(buf + 32, &wb->merklebin[i][0],     32);              /* sibling (LE)    */
+		gen_hash(buf, running, 64);
+	}
+
+	/* Header we hash (swap) stores merkle at bytes 36..67 */
+	memcpy(header_mr, header80 + 36, 32);
+
+	/* Fast path: compare directly to the header we actually hash */
+	if (memcmp(running, header_mr, 32) == 0) {
+		LOGNOTICE("Merkle root validation PASSED (matched hashed header)");
+		return true;
+	}
+
+	/* If the caller passed the pre-flip header by mistake, be tolerant but loud */
+	flip_32((uint32_t *)running_le, (const uint32_t *)running);
+	if (memcmp(running_le, header_mr, 32) == 0) {
+		char want_be[65], have[65];
+		__bin2hex(want_be, running,   32);
+		__bin2hex(have,    header_mr, 32);
+		LOGWARNING("Merkle root validation PASSED only after 32-bit flip "
+		"(caller likely provided pre-flip header). computed(be)=%s header=%s",
+		want_be, have);
+		return true;
+	}
+
+	/* No match: log both orientations for quick diagnosis */
+	{
+	char want_be[65], want_le[65], have[65];
+		__bin2hex(want_be, running,     32);
+		__bin2hex(want_le, running_le,  32);
+		__bin2hex(have,    header_mr,   32);
+		LOGWARNING("Merkle root validation FAILED: computed(be)=%s computed(le)=%s header=%s (branches=%d)",
+		want_be, want_le, have, wb->merkles);
+	}
+	return false;
 }

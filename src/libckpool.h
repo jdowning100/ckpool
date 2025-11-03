@@ -196,7 +196,7 @@ static inline void flip_80(void *dest_p, const void *src_p)
 
 void logmsg(int loglevel, const char *fmt, ...);
 
-#define DEFLOGBUFSIZ 512
+#define DEFLOGBUFSIZ 1024
 
 #define LOGMSGSIZ(__siz, __lvl, __fmt, ...) do { \
 	char *BUF; \
@@ -607,8 +607,11 @@ void suffix_string(double val, char *buf, size_t bufsiz, int sigdigits);
 double le256todouble(const uchar *target);
 double be256todouble(const uchar *target);
 double diff_from_target(uchar *target);
+double diff_from_target_scrypt(uchar *target);
 double diff_from_betarget(uchar *target);
+double diff_from_betarget_scrypt(uchar *target);
 double diff_from_nbits(char *nbits);
+double diff_from_nbits_scrypt(char *nbits);
 void target_from_diff(uchar *target, double diff);
 
 void gen_hash(uchar *data, uchar *hash, int len);

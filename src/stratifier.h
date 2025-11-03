@@ -37,6 +37,9 @@ struct genwork {
 	char target[68];
 	double diff;
 	double network_diff;
+	double share_diff;  /* Minimum difficulty for share submission (from GBT target field) */
+	bool scrypt_algo;   /* true for Scrypt (Litecoin), false for SHA256d (Bitcoin) */
+	bool block_submitted; /* Has a block already been submitted for this job? */
 	uint32_t version;
 	uint32_t curtime;
 	char prevhash[68];
@@ -58,12 +61,23 @@ struct genwork {
 	json_t *merkle_array;
 
 	/* Quai-specific fields from getBlockTemplate */
-	char *coinbaseaux;       // Pre-constructed scriptSig from go-quai (hex string)
-	uchar *coinbaseaux_bin;  // Binary version of coinbaseaux
-	int coinbaseaux_len;     // Length of binary coinbaseaux
-	char *payoutscript;      // scriptPubKey for coinbase output (hex string)
-	uchar *payoutscript_bin; // Binary version of payoutscript
-	int payoutscript_len;    // Length of binary payoutscript
+	char *coinbaseaux;       // Pre-constructed scriptSig from go-quai (hex string) - DEPRECATED
+	uchar *coinbaseaux_bin;  // Binary version of coinbaseaux - DEPRECATED
+	int coinbaseaux_len;     // Length of binary coinbaseaux - DEPRECATED
+	char *payoutscript;      // scriptPubKey for coinbase output (hex string) - DEPRECATED
+	uchar *payoutscript_bin; // Binary version of payoutscript - DEPRECATED
+	int payoutscript_len;    // Length of binary payoutscript - DEPRECATED
+
+	/* New Quai stratum-style fields from getBlockTemplate */
+	char *gbt_coinb1;        // Pre-constructed coinbase1 from go-quai (hex string)
+	uchar *gbt_coinb1_bin;   // Binary version of coinb1
+	int gbt_coinb1_len;      // Length of binary coinb1
+	char *gbt_coinb2;        // Pre-constructed coinbase2 from go-quai (hex string)
+	uchar *gbt_coinb2_bin;   // Binary version of coinb2
+	int gbt_coinb2_len;      // Length of binary coinb2
+	int extranonce1_len;     // Length of extranonce1 field (4 bytes)
+	int extranonce2_len;     // Length of extranonce2 field (8 bytes)
+	int coinbase_aux_extra_bytes_len; // Length of extra bytes in coinb2 (32 bytes)
 
 	/* Template variables, lengths are binary lengths! */
 	char *coinb1; // coinbase1
@@ -92,6 +106,8 @@ struct genwork {
 	bool proxy; /* This workbase is proxied work */
 
 	bool incomplete; /* This is a remote workinfo without all the txn data */
+
+	bool coinb_parts_supplied; /* true if GBT provided coinb1 & coinb2 */
 
 	json_t *json; /* getblocktemplate json */
 };

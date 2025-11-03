@@ -631,12 +631,18 @@ void keep_sockalive(int fd)
 	const int tcp_one = 1;
 	const int tcp_keepidle = 45;
 	const int tcp_keepintvl = 30;
+	struct sockaddr_storage addr;
+	socklen_t len = sizeof(addr);
 
 	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const void *)&tcp_one, sizeof(tcp_one));
-	setsockopt(fd, SOL_TCP, TCP_NODELAY, (const void *)&tcp_one, sizeof(tcp_one));
-	setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &tcp_one, sizeof(tcp_one));
-	setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &tcp_keepidle, sizeof(tcp_keepidle));
-	setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &tcp_keepintvl, sizeof(tcp_keepintvl));
+
+	/* Only set TCP-specific options if this is actually a TCP socket (not Unix domain) */
+	if (getsockname(fd, (struct sockaddr *)&addr, &len) == 0 && addr.ss_family != AF_UNIX) {
+		setsockopt(fd, SOL_TCP, TCP_NODELAY, (const void *)&tcp_one, sizeof(tcp_one));
+		setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &tcp_one, sizeof(tcp_one));
+		setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &tcp_keepidle, sizeof(tcp_keepidle));
+		setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &tcp_keepintvl, sizeof(tcp_keepintvl));
+	}
 }
 
 void nolinger_socket(int fd)
@@ -667,7 +673,7 @@ void _close(int *fd, const char *file, const char *func, const int line)
 	if (*fd < 0)
 		return;
 	sockd = *fd;
-	LOGDEBUG("Closing file handle %d", sockd);
+	/* Closing file handle - logging disabled to reduce verbosity */
 	*fd = -1;
 	if (unlikely(close(sockd))) {
 		LOGWARNING("Close of fd %d failed with errno %d:%s from %s %s:%d",
@@ -755,7 +761,7 @@ int connect_socket(char *url, char *port)
 				len = sizeof(err);
 				n = getsockopt(sockd, SOL_SOCKET, SO_ERROR, (void *)&err, &len);
 				if (!n && !err) {
-					LOGDEBUG("Succeeded delayed connect");
+					/* Succeeded delayed connect - logging disabled to reduce verbosity */
 					block_socket(sockd);
 					break;
 				}
@@ -2173,6 +2179,23 @@ double diff_from_target(uchar *target)
 	return truediffone / dcut64;
 }
 
+/* Return a difficulty from a binary target for Scrypt algorithm
+ * Litecoin/Scrypt diff1 target is 65536x (2^16) larger than Bitcoin's:
+ *   BTC max target (diff1):   0x00000000FFFF0000000000000000000000000000000000000000000000000000
+ *   LTC max target (diff1):   0x0000FFFF00000000000000000000000000000000000000000000000000000000
+ * The FFFF is shifted left by 16 bits (4 hex digits), making it 2^16 = 65536 times larger.
+ * Therefore use (truediffone / 65536) as the Scrypt diff1 constant. */
+double diff_from_target_scrypt(uchar *target)
+{
+    double dcut64;
+
+    dcut64 = le256todouble(target);
+    if (unlikely(dcut64 <= 0))
+        dcut64 = 1;
+    /* Scrypt difficulty 1 target is 65536 (2^16) times larger than SHA256 */
+    return (truediffone / 65536.0) / dcut64;
+}
+
 /* Return a difficulty from a binary big endian target */
 double diff_from_betarget(uchar *target)
 {
@@ -2182,6 +2205,18 @@ double diff_from_betarget(uchar *target)
 	if (unlikely(dcut64 <= 0))
 		dcut64 = 1;
 	return truediffone / dcut64;
+}
+
+/* Return a difficulty from a binary big endian target for Scrypt algorithm */
+double diff_from_betarget_scrypt(uchar *target)
+{
+    double dcut64;
+
+    dcut64 = be256todouble(target);
+    if (unlikely(dcut64 <= 0))
+        dcut64 = 1;
+    /* Scrypt difficulty 1 target is 65536 (2^16) times larger than SHA256 */
+    return (truediffone / 65536.0) / dcut64;
 }
 
 /* Return the network difficulty from the block header which is in packed form,
@@ -2204,6 +2239,27 @@ double diff_from_nbits(char *nbits)
 	}
 	memcpy(target + (32 - shift), nbits + 1, 3);
 	return diff_from_betarget(target);
+}
+
+/* Return the network difficulty from the block header for Scrypt algorithm */
+double diff_from_nbits_scrypt(char *nbits)
+{
+	uint8_t shift = nbits[0];
+	uchar target[32] = {};
+	char *nb;
+
+	nb = bin2hex(nbits, 4);
+	LOGDEBUG("Nbits (Scrypt) is %s", nb);
+	free(nb);
+	if (unlikely(shift < 3)) {
+		LOGWARNING("Corrupt shift of %d in nbits", shift);
+		shift = 3;
+	} else if (unlikely(shift > 32)) {
+		LOGWARNING("Corrupt shift of %d in nbits", shift);
+		shift = 32;
+	}
+	memcpy(target + (32 - shift), nbits + 1, 3);
+	return diff_from_betarget_scrypt(target);
 }
 
 void target_from_diff(uchar *target, double diff)

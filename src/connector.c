@@ -1558,7 +1558,7 @@ void *connector(void *arg)
 		memset(&serv_addr, 0, sizeof(serv_addr));
 		serv_addr.sin_family = AF_INET;
 		serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-		serv_addr.sin_port = htons(ckp->proxy ? 3334 : 3333);
+		serv_addr.sin_port = htons(ckp->port);
 		do {
 			ret = bind(sockd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
 
@@ -1583,6 +1583,7 @@ void *connector(void *arg)
 		url_from_socket(sockd, newurl, newport);
 		ASPRINTF(&ckp->serverurl[0], "%s:%s", newurl, newport);
 		ckp->serverurls = 1;
+		LOGNOTICE("Connector listening on port %d", ckp->port);
 	} else {
 		cdata->serverfd = ckalloc(sizeof(int *) * ckp->serverurls);
 

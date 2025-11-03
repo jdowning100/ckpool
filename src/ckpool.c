@@ -553,7 +553,7 @@ static void clear_bufline(connsock_t *cs)
 		cs->bufsize = PAGESIZE;
 		getsockopt(cs->fd, SOL_SOCKET, SO_RCVBUF, &cs->rcvbufsiz, &optlen);
 		cs->rcvbufsiz /= 2;
-		LOGDEBUG("connsock rcvbufsiz detected as %d", cs->rcvbufsiz);
+		/* connsock rcvbufsiz detected - logging disabled to reduce verbosity */
 	} else if (cs->buflen) {
 		memmove(cs->buf, cs->buf + cs->bufofs, cs->buflen);
 		memset(cs->buf + cs->buflen, 0, cs->bufofs);
@@ -1489,6 +1489,8 @@ static void parse_config(ckpool_t *ckp)
 	json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
 	json_get_string(&ckp->logdir, json_conf, "logdir");
 	json_get_int(&ckp->maxclients, json_conf, "maxclients");
+	json_get_int(&ckp->port, json_conf, "port");
+	json_get_bool(&ckp->scrypt_algo, json_conf, "scrypt_algo");
 	json_get_double(&ckp->donation, json_conf, "donation");
 	/* Avoid dust-sized donations */
 	if (ckp->donation < 0.1)
@@ -1573,6 +1575,7 @@ static struct option long_options[] = {
 	{"name",	required_argument,	0,	'n'},
 	{"node",	no_argument,		0,	'N'},
 	{"passthrough",	no_argument,		0,	'P'},
+	{"port",	required_argument,	0,	'O'},
 	{"proxy",	no_argument,		0,	'p'},
 	{"quiet",	no_argument,		0,	'q'},
 	{"redirector",	no_argument,		0,	'R'},
@@ -1626,12 +1629,16 @@ int main(int argc, char **argv)
 	if (!strcmp(appname, "ckproxy"))
 		ckp.proxy = true;
 
-	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:tu", long_options, &i)) != -1) {
+	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:O:PpqRS:s:tuY", long_options, &i)) != -1) {
 		switch (c) {
 			case 'B':
 				if (ckp.proxy)
 					quit(1, "Cannot set both proxy and btcsolo mode");
 				ckp.btcsolo = true;
+				break;
+			case 'Y':
+				ckp.scrypt_algo = true;
+				LOGNOTICE("Scrypt algorithm enabled (Litecoin mode)");
 				break;
 			case 'c':
 				ckp.config = optarg;
@@ -1684,6 +1691,11 @@ int main(int argc, char **argv)
 			case 'n':
 				ckp.name = optarg;
 				break;
+			case 'O':
+				ckp.port = atoi(optarg);
+				if (ckp.port < 1 || ckp.port > 65535)
+					quit(1, "Invalid port number %d (must be 1-65535)", ckp.port);
+				break;
 			case 'P':
 				if (ckp.proxy || ckp.redirector || ckp.userproxy || ckp.node)
 					quit(1, "Cannot set another proxy type or redirector and passthrough mode");
@@ -1733,6 +1745,18 @@ int main(int argc, char **argv)
 	snprintf(buf, 15, "%s", ckp.name);
 	prctl(PR_SET_NAME, buf, 0, 0, 0);
 	memset(buf, 0, 15);
+
+	/* Set default port if not specified */
+	if (!ckp.port) {
+		if (ckp.proxy)
+			ckp.port = 3334;
+		else
+			ckp.port = 3333;
+	}
+
+	/* Log if Scrypt algorithm is enabled */
+	if (ckp.scrypt_algo)
+		LOGNOTICE("Scrypt algorithm enabled (configured for Litecoin/Scrypt mining)");
 
 	if (ckp.grpnam) {
 		struct group *group = getgrnam(ckp.grpnam);
@@ -1787,8 +1811,11 @@ int main(int argc, char **argv)
 
 	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy)
 		quit(0, "Non solo mining must have a btcaddress in config, aborting!");
-	if (!ckp.blockpoll)
-		ckp.blockpoll = 100;
+    if (!ckp.blockpoll)
+        ckp.blockpoll = 1000;
+    /* Enforce a minimum poll interval of 1s to avoid hammering the node */
+    if (ckp.blockpoll < 1000)
+        ckp.blockpoll = 1000;
 	if (!ckp.nonce1length)
 		ckp.nonce1length = 4;
 	else if (ckp.nonce1length < 2 || ckp.nonce1length > 8)
