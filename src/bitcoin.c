@@ -400,14 +400,37 @@ retry:
 		res_ret = json_string_value(res_val);
 		if (res_ret && strlen(res_ret)) {
 			LOGWARNING("SUBMIT BLOCK RETURNED: %s", res_ret);
-			/* Consider duplicate response as an accepted block */
-			if (safecmp(res_ret, "duplicate"))
+			/* Accept if "duplicate" (already mined) */
+			if (!safecmp(res_ret, "duplicate")) {
+				LOGWARNING("BLOCK ACCEPTED (duplicate)!");
+				ret = true;
 				goto out;
+			}
+			/* Accept if result looks like a block hash (0x + 64 hex chars) */
+			if (strncmp(res_ret, "0x", 2) == 0 && strlen(res_ret) == 66) {
+				bool valid_hex = true;
+				for (int i = 2; i < 66; i++) {
+					char c = res_ret[i];
+					if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+						valid_hex = false;
+						break;
+					}
+				}
+				if (valid_hex) {
+					LOGWARNING("BLOCK ACCEPTED! Hash: %s", res_ret);
+					ret = true;
+					goto out;
+				}
+			}
+			/* Any other string response is an error */
+			LOGWARNING("BLOCK REJECTED: %s", res_ret);
+			goto out;
 		} else {
 			LOGWARNING("SUBMIT BLOCK GOT NO RESPONSE!");
 			goto out;
 		}
 	}
+	/* null result means success (current Quai behavior) */
 	LOGWARNING("BLOCK ACCEPTED!");
 	ret = true;
 out:

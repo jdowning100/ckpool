@@ -6264,7 +6264,7 @@ test_blocksolve(const stratum_instance_t *client, workbase_t *wb, const uchar *d
 
 		/* Convert target from hex and byte-swap to match hash byte order */
 		hex2bin(target, wb->target, 32);
-		swap_256(target_swap, target);
+		bswap_256(target_swap, target);
 		meets_target = fulltest(hash, target_swap);
 
 		if (!meets_target) {
@@ -6889,7 +6889,7 @@ out_nowb:
 			hex2bin(target, target_to_use, 32);
 			/* Target hex string is big-endian, but hash is little-endian.
 			 * Byte-swap target to match hash byte order for fulltest() */
-			swap_256(target_swap, target);
+			bswap_256(target_swap, target);
 			meets_target = fulltest(hash, target_swap);
 		} else {
 			/* Fallback to difficulty comparison if target is not available */
